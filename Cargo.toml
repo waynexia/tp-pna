@@ -1,11 +1,12 @@
 [package]
 name = "kvs"
 version = "0.1.0"
+description = "a key-value server"
 authors = ["Ruihang Xia <waynestxia@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-clap = "2.33.0"
+clap = { features = ["yaml"] }
 
 [dev-dependencies]
 assert_cmd = "0.11.0"
