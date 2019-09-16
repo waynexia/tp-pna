@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 /// Used to create and operate a `KvStore` instance.
+#[derive(Default)]
 pub struct KvStore {
     data: HashMap<String, String>,
 }
