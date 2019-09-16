@@ -14,7 +14,7 @@ subcommands:
             - value:
                 required: true
 
-    - remove:
+    - rm:
         about: Remove a given key
         args: 
             - key: 
