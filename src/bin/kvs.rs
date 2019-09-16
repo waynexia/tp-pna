@@ -21,11 +21,11 @@ fn main() {
             eprintln!("unimplemented!");
             exit(1);
         }
-        ("set", Some(sub_m)) => {
+        ("set", Some(_sub_m)) => {
             eprintln!("unimplemented!");
             exit(1);
         }
-        ("rm", Some(sub_m)) => {
+        ("rm", Some(_sub_m)) => {
             eprintln!("unimplemented!");
             exit(1);
         }

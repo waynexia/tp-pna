@@ -1,19 +1,25 @@
-pub struct KvStore {}
+use std::collections::HashMap;
+
+pub struct KvStore{
+    data: HashMap<String,String>,
+}
 
 impl KvStore {
     pub fn new() -> KvStore {
-        KvStore {}
+        KvStore {
+            data: HashMap::new(),
+        }
     }
 
     pub fn get(&mut self, key: String) -> Option<String> {
-        unimplemented!();
+        self.data.get(&key).cloned()
     }
 
     pub fn set(&mut self, key: String, value: String) {
-        unimplemented!();
+        self.data.insert(key,value);
     }
 
     pub fn remove(&mut self, key: String) {
-        unimplemented!();
+        self.data.remove(&key);
     }
 }
