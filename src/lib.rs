@@ -4,6 +4,12 @@
 //! At this stage, it's implemented with `HashMap`.
 //! Data is stored in memory and is nonpersistent.
 use std::collections::HashMap;
+// pub use crate::error::Result;
+
+mod error;
+///
+pub use error::Result;
+use std::path::Path;
 
 /// Used to create and operate a `KvStore` instance.
 #[derive(Default)]
@@ -25,6 +31,11 @@ impl KvStore {
         }
     }
 
+    ///
+    pub fn open(path: &Path) -> Result<KvStore> {
+        panic!();
+    }
+
     /// Returns a value corresponding to the key.
     ///
     /// # Example:
@@ -36,39 +47,41 @@ impl KvStore {
     /// assert_eq!(kvs.get("key1".to_owned()), Some("value1".to_owned()));
     /// assert_eq!(kvs.get("key2".to_owned()), None);
     /// ```
-    pub fn get(&mut self, key: String) -> Option<String> {
-        self.data.get(&key).cloned()
+    pub fn get(&mut self, key: String) -> Result<Option<String>> {
+        Ok(self.data.get(&key).cloned())
     }
 
     /// Inserts a key-value pair into the store.
-    /// 
+    ///
     /// # Example
     /// ```rust
     /// use kvs::KvStore;
-    /// 
+    ///
     /// let mut kvs = KvStore::new();
     /// kvs.set("key1".to_owned(), "value1".to_owned());
     /// assert_eq!(kvs.get("key1".to_owned()), Some("value1".to_owned()));
-    /// 
+    ///
     /// kvs.set("key1".to_owned(), "value2".to_owned());
     /// assert_eq!(kvs.get("key1".to_owned()), Some("value2".to_owned()))
     /// ```
-    pub fn set(&mut self, key: String, value: String) {
+    pub fn set(&mut self, key: String, value: String) -> Result<()> {
         self.data.insert(key, value);
+        Ok(())
     }
 
     /// Removes a key from the map.
-    /// 
+    ///
     /// # Example
     /// ```rust
     /// use kvs::KvStore;
-    /// 
+    ///
     /// let mut kvs = KvStore::new();
     /// kvs.set("key1".to_owned(), "value1".to_owned());
     /// kvs.remove("key1".to_owned());
     /// assert_eq!(kvs.get("key1".to_owned()),None);
     /// ```
-    pub fn remove(&mut self, key: String) {
+    pub fn remove(&mut self, key: String) -> Result<()> {
         self.data.remove(&key);
+        Ok(())
     }
 }

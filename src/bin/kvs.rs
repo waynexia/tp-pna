@@ -1,9 +1,9 @@
 extern crate clap;
 use clap::App;
+use kvs::{KvStore, Result};
 use std::process::exit;
-// use kvs::KvStore;
 
-fn main() {
+fn main() -> Result<()> {
     /* load clap config from yaml file */
     let yaml = clap::load_yaml!("cli.yml");
     let matches = App::from_yaml(yaml)
