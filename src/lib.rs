@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::BufReader;
+use std::io::{prelude::*, BufReader, SeekFrom};
 
 mod error;
 use error::KvsError;
@@ -66,7 +66,13 @@ impl KvStore {
     /// ```
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
         let index = self.build_index()?;
-        Ok(index.get(&key).cloned())
+        // maybe can use some combinator here
+        self.get_value_by_offset(
+            match index.get(&key){
+                Some(item) => item,
+                None => return Ok(None),
+            }
+        )
     }
 
     /// Inserts a key-value pair into the store.
@@ -119,30 +125,42 @@ impl KvStore {
         Ok(())
     }
 
-    fn build_index(&self) -> Result<HashMap<String, String>> {
-        let mut index: HashMap<String, String> = HashMap::new();
+    fn build_index(&self) -> Result<HashMap<String, usize>> {
+        let mut index: HashMap<String, usize> = HashMap::new();
         let file = File::open(&self.db_file_path)?;
         let reader = BufReader::new(file);
         let der = serde_json::Deserializer::from_reader(reader);
-        let iter = der.into_iter::<Record>();
-        for record_result in iter {
-            let record = record_result?;
-            match record.op {
-                OpType::Set => index.insert(
-                    record.key.clone(),
-                    record
-                        .value
-                        .ok_or(KvsError::from("Expect a value in log file".to_owned()))?
-                        .clone(),
-                ),
-                OpType::Remove => index.remove(&record.key),
-                _ => {
-                    return Err(KvsError::from(
-                        "Unexpected command: `Get` in log file".to_owned(),
-                    ))
-                }
+        let mut iter = der.into_iter::<Record>();
+
+        loop {
+            let offset = iter.byte_offset();
+            match iter.next() {
+                Some(item) => {
+                    let record = item?;
+                    match record.op {
+                    OpType::Set => index.insert(record.key.clone(), offset.to_owned()),
+                    OpType::Remove => index.remove(&record.key),
+                    _ => {
+                        return Err(KvsError::from(
+                            "Unexpected command: `Get` in log file".to_owned(),
+                        ));
+                    }
+                }},
+                None => break,
             };
         }
         Ok(index)
+    }
+
+    fn get_value_by_offset(&self, offset: &usize) -> Result<Option<String>> {
+        let mut file = File::open(&self.db_file_path)?;
+        file.seek(SeekFrom::Start(*offset as u64))?;
+        let reader = BufReader::new(file);
+        let der = serde_json::Deserializer::from_reader(reader);
+        let mut iter = der.into_iter::<Record>();
+        let record = iter
+            .next()
+            .ok_or(KvsError::from("Unable to deserialize file".to_owned()))?;
+        Ok(record?.value)
     }
 }
