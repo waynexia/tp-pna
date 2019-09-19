@@ -5,7 +5,7 @@
 //! Data is stored in memory and is nonpersistent.
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::{metadata, rename, File, OpenOptions};
 use std::io::{prelude::*, BufReader, SeekFrom};
 
 mod error;
@@ -67,12 +67,10 @@ impl KvStore {
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
         let index = self.build_index()?;
         // maybe can use some combinator here
-        self.get_value_by_offset(
-            match index.get(&key){
-                Some(item) => item,
-                None => return Ok(None),
-            }
-        )
+        self.get_value_by_offset(match index.get(&key) {
+            Some(item) => item,
+            None => return Ok(None),
+        })
     }
 
     /// Inserts a key-value pair into the store.
@@ -94,8 +92,7 @@ impl KvStore {
             key,
             value: Some(value),
         };
-        let mut file = OpenOptions::new().append(true).open(&self.db_file_path)?;
-        serde_json::to_writer(&mut file, &record)?;
+        self.write_log(record)?;
         Ok(())
     }
 
@@ -120,8 +117,7 @@ impl KvStore {
             key,
             value: None,
         };
-        let mut file = OpenOptions::new().append(true).open(&self.db_file_path)?;
-        serde_json::to_writer(&mut file, &record)?;
+        self.write_log(record)?;
         Ok(())
     }
 
@@ -138,14 +134,15 @@ impl KvStore {
                 Some(item) => {
                     let record = item?;
                     match record.op {
-                    OpType::Set => index.insert(record.key.clone(), offset.to_owned()),
-                    OpType::Remove => index.remove(&record.key),
-                    _ => {
-                        return Err(KvsError::from(
-                            "Unexpected command: `Get` in log file".to_owned(),
-                        ));
+                        OpType::Set => index.insert(record.key.clone(), offset.to_owned()),
+                        OpType::Remove => index.remove(&record.key),
+                        _ => {
+                            return Err(KvsError::from(
+                                "Unexpected command: `Get` in log file".to_owned(),
+                            ));
+                        }
                     }
-                }},
+                }
                 None => break,
             };
         }
@@ -162,5 +159,52 @@ impl KvStore {
             .next()
             .ok_or(KvsError::from("Unable to deserialize file".to_owned()))?;
         Ok(record?.value)
+    }
+
+    fn write_log(&self, record: Record) -> Result<()> {
+        // try to use enviroment variable instead?
+        let log_size_limit = 10_0000;
+
+        let size = metadata(&self.db_file_path)?.len();
+        if size > log_size_limit {
+            self.compact_log()?;
+        }
+
+        let mut file = OpenOptions::new().append(true).open(&self.db_file_path)?;
+        serde_json::to_writer(&mut file, &record)?;
+
+        Ok(())
+    }
+
+    // strategy: just copy log entry that still alive into a new file
+    //      then use it to overwrite the old log file.
+    fn compact_log(&self) -> Result<()> {
+        let index = self.build_index()?;
+        let something = &format!(
+            "{}_compacted",
+            self.db_file_path.to_str().ok_or(KvsError::from(
+                "Error occurs while transfering a path".to_owned()
+            ))?
+        );
+        let new_log_path = Path::new(something);
+        File::create(&new_log_path)?;
+        let mut out_file = OpenOptions::new().append(true).open(new_log_path)?;
+        let mut in_file = File::open(&self.db_file_path)?;
+
+        println!("before copy");
+
+        for (_, offset) in index.iter() {
+            in_file.seek(SeekFrom::Start(*offset as u64))?;
+            let record = serde_json::Deserializer::from_reader(BufReader::new(&in_file))
+                .into_iter::<Record>()
+                .next()
+                .ok_or(KvsError::from("Unable to deserialize file".to_owned()))?;
+            serde_json::to_writer(&mut out_file, &record?)?;
+        }
+
+        println!("before rename");
+        
+        rename(&new_log_path, &self.db_file_path)?;
+        Ok(())
     }
 }
