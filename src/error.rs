@@ -4,15 +4,20 @@ use std::fmt;
 use std::io;
 use std::result;
 
-///
+/// Error types for kvs
 #[derive(Debug)]
 pub enum KvsError {
+    /// IO error
     IO(io::Error),
+    /// create `Serde`'s error
     Serde(serde_json_error::Error),
-    Kvs(Box<String>),
+    /// Cannot find a given key in store
+    KeyNotFound,
+    /// Cannot deserialize something in log file
+    Undeserialized,
 }
 
-///
+/// Result alias
 pub type Result<T> = result::Result<T, KvsError>;
 
 impl fmt::Display for KvsError {
@@ -20,7 +25,8 @@ impl fmt::Display for KvsError {
         match *self {
             KvsError::IO(ref err) => write!(f, "IO error {}", err),
             KvsError::Serde(ref err) => write!(f, "Serde error {}", err),
-            KvsError::Kvs(ref desc) => write!(f, "Kvs inner error {}", desc),
+            KvsError::KeyNotFound => write!(f, "Key not found"),
+            KvsError::Undeserialized => write!(f, "Unable to deserialize log file"),
         }
     }
 }
@@ -30,7 +36,8 @@ impl error::Error for KvsError {
         match *self {
             KvsError::IO(ref err) => err.description(),
             KvsError::Serde(ref err) => err.description(),
-            KvsError::Kvs(ref desc) => &desc,
+            KvsError::KeyNotFound => "Key not found",
+            KvsError::Undeserialized => "Unable to deserialize log file",
         }
     }
 
@@ -38,8 +45,8 @@ impl error::Error for KvsError {
         match *self {
             KvsError::IO(ref err) => Some(err),
             KvsError::Serde(ref err) => Some(err),
-            // KvsError::Kvs(ref desc) => Some(&KvsError::from(*desc.deref())),
-            KvsError::Kvs(ref _err) => None,
+            KvsError::KeyNotFound => None,
+            KvsError::Undeserialized => None,
         }
     }
 }
@@ -53,11 +60,5 @@ impl From<io::Error> for KvsError {
 impl From<serde_json_error::Error> for KvsError {
     fn from(err: serde_json_error::Error) -> KvsError {
         KvsError::Serde(err)
-    }
-}
-
-impl From<String> for KvsError {
-    fn from(err: String) -> KvsError {
-        KvsError::Kvs(Box::from(err))
     }
 }

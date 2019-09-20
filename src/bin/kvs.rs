@@ -1,6 +1,6 @@
 extern crate clap;
 use clap::App;
-use kvs::{KvStore, Result};
+use kvs::{KvsError, KvStore, Result};
 use std::path::Path;
 use std::process::exit;
 
@@ -30,11 +30,13 @@ fn main() -> Result<()> {
             )?;
         }
         ("rm", Some(sub_m)) => {
-            if kvstore.get(sub_m.value_of("key").unwrap().to_owned())? == None {
-                println!("Key not found");
-                exit(1);
-            } else {
-                kvstore.remove(sub_m.value_of("key").unwrap().to_owned())?;
+            match kvstore.remove(sub_m.value_of("key").unwrap().to_owned()) {
+                Err(KvsError::KeyNotFound) => {
+                    println!("Key not found");
+                    exit(1);
+                }
+                Ok(()) => {},
+                Err(e) => return Err(e),
             }
         }
 

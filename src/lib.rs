@@ -9,11 +9,7 @@ use std::fs::{metadata, rename, File, OpenOptions};
 use std::io::{prelude::*, BufReader, SeekFrom};
 
 mod error;
-use error::KvsError;
-/// General kvs error type.
-/// Include Result alias:
-///     pub type Result<T> = result::Result<T, KvsError>;
-pub use error::Result;
+pub use error::{KvsError, Result};
 use std::path::Path;
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -33,8 +29,6 @@ struct Record {
 /// Used to create and operate a `KvStore` instance.
 pub struct KvStore {
     index: HashMap<String, usize>,
-    // writer: io::BufWriter<File>,
-    // file: File,
     db_file_path: Box<Path>,
 }
 
@@ -56,12 +50,7 @@ impl KvStore {
             File::create(&db_file_path)?;
         }
         let index = KvStore::build_index(&db_file_path)?;
-        // let file = OpenOptions::new().append(true).open(db_file_path)?;
-        // let writer = io::BufWriter::new(file);
         Ok(KvStore {
-            // data: HashMap::new(),
-            // writer,
-            // file,
             index,
             db_file_path: Box::from(db_file_path),
         })
@@ -104,11 +93,11 @@ impl KvStore {
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
         let record = Record {
             op: OpType::Set,
-            key:key.clone(),
+            key: key.clone(),
             value: Some(value),
         };
         let offset = self.write_log(record)?;
-        self.index.insert(key,offset);
+        self.index.insert(key, offset);
         Ok(())
     }
 
@@ -125,9 +114,7 @@ impl KvStore {
     /// assert_eq!(kvs.get("key1".to_owned()).unwrap(),None);
     /// ```
     pub fn remove(&mut self, key: String) -> Result<()> {
-        self.index
-            .get(&key)
-            .ok_or(KvsError::from("Try to remove a non-exist key".to_owned()))?;
+        self.index.get(&key).ok_or(KvsError::KeyNotFound)?;
         let record = Record {
             op: OpType::Remove,
             key: key.clone(),
@@ -154,9 +141,7 @@ impl KvStore {
                         OpType::Set => index.insert(record.key.clone(), offset.to_owned()),
                         OpType::Remove => index.remove(&record.key),
                         _ => {
-                            return Err(KvsError::from(
-                                "Unexpected command: `Get` in log file".to_owned(),
-                            ));
+                            return Err(KvsError::Undeserialized);
                         }
                     }
                 }
@@ -172,7 +157,7 @@ impl KvStore {
         let record = serde_json::Deserializer::from_reader(BufReader::new(file))
             .into_iter::<Record>()
             .next()
-            .ok_or(KvsError::from("Unable to deserialize file".to_owned()))?;
+            .ok_or(KvsError::Undeserialized)?;
         Ok(record?.value)
     }
 
@@ -193,14 +178,9 @@ impl KvStore {
     }
 
     // strategy: just copy log entry that still alive into a new file
-    //      then use it to overwrite the old log file.
+    // then use it to overwrite the old log file.
     fn compact_log(&self) -> Result<()> {
-        let something = &format!(
-            "{}_compacted",
-            self.db_file_path.to_str().ok_or(KvsError::from(
-                "Error occurs while transfering a path".to_owned()
-            ))?
-        );
+        let something = &format!("{}_compacted", self.db_file_path.to_str().unwrap());
         let new_log_path = Path::new(something);
         File::create(&new_log_path)?;
         let mut out_file = OpenOptions::new().append(true).open(new_log_path)?;
@@ -211,7 +191,7 @@ impl KvStore {
             let record = serde_json::Deserializer::from_reader(BufReader::new(&in_file))
                 .into_iter::<Record>()
                 .next()
-                .ok_or(KvsError::from("Unable to deserialize file".to_owned()))?;
+                .ok_or(KvsError::Undeserialized)?;
             serde_json::to_writer(&mut out_file, &record?)?;
         }
 
