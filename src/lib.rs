@@ -10,7 +10,9 @@ use std::io::{prelude::*, BufReader, SeekFrom};
 
 mod error;
 use error::KvsError;
-///
+/// General kvs error type.
+/// Include Result alias:
+///     pub type Result<T> = result::Result<T, KvsError>;
 pub use error::Result;
 use std::path::Path;
 
@@ -37,7 +39,17 @@ pub struct KvStore {
 }
 
 impl KvStore {
+    /// Open a kvs located in given path.
+    /// If no log file existing here it will be created.
+    /// And if there is one, kvs will use it to recover previous status.
     ///
+    /// # Example:
+    /// ```rust
+    /// use kvs::KvStore;
+    /// use std::path::Path;
+    ///
+    /// let mut kvs = KvStore::open(Path::new("./")).unwrap();
+    /// ```
     pub fn open(path: &Path) -> Result<KvStore> {
         let db_file_path = path.join(Path::new("record.db"));
         if !db_file_path.exists() {
@@ -58,11 +70,12 @@ impl KvStore {
     /// # Example:
     /// ```rust
     /// use kvs::KvStore;
+    /// use std::path::Path;
     ///
-    /// let mut kvs = KvStore::new();
+    /// let mut kvs = KvStore::open(Path::new("./")).unwrap();
     /// kvs.set("key1".to_owned(), "value1".to_owned());
-    /// assert_eq!(kvs.get("key1".to_owned()), Some("value1".to_owned()));
-    /// assert_eq!(kvs.get("key2".to_owned()), None);
+    /// assert_eq!(kvs.get("key1".to_owned()).unwrap(), Some("value1".to_owned()));
+    /// assert_eq!(kvs.get("key2".to_owned()).unwrap(), None);
     /// ```
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
         let index = self.build_index()?;
@@ -78,13 +91,14 @@ impl KvStore {
     /// # Example
     /// ```rust
     /// use kvs::KvStore;
+    /// use std::path::Path;
     ///
-    /// let mut kvs = KvStore::new();
-    /// kvs.set("key1".to_owned(), "value1".to_owned());
-    /// assert_eq!(kvs.get("key1".to_owned()), Some("value1".to_owned()));
+    /// let mut kvs = KvStore::open(Path::new("./")).unwrap();
+    /// kvs.set("key1".to_owned(), "value1".to_owned()).unwrap();
+    /// assert_eq!(kvs.get("key1".to_owned()).unwrap(), Some("value1".to_owned()));
     ///
-    /// kvs.set("key1".to_owned(), "value2".to_owned());
-    /// assert_eq!(kvs.get("key1".to_owned()), Some("value2".to_owned()))
+    /// kvs.set("key1".to_owned(), "value2".to_owned()).unwrap();
+    /// assert_eq!(kvs.get("key1".to_owned()).unwrap(), Some("value2".to_owned()))
     /// ```
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
         let record = Record {
@@ -101,11 +115,12 @@ impl KvStore {
     /// # Example
     /// ```rust
     /// use kvs::KvStore;
+    /// use std::path::Path;
     ///
-    /// let mut kvs = KvStore::new();
-    /// kvs.set("key1".to_owned(), "value1".to_owned());
-    /// kvs.remove("key1".to_owned());
-    /// assert_eq!(kvs.get("key1".to_owned()),None);
+    /// let mut kvs = KvStore::open(Path::new("./")).unwrap();
+    /// kvs.set("key1".to_owned(), "value1".to_owned()).unwrap();
+    /// kvs.remove("key1".to_owned()).unwrap();
+    /// assert_eq!(kvs.get("key1".to_owned()).unwrap(),None);
     /// ```
     pub fn remove(&mut self, key: String) -> Result<()> {
         let index = self.build_index()?;
@@ -123,10 +138,10 @@ impl KvStore {
 
     fn build_index(&self) -> Result<HashMap<String, usize>> {
         let mut index: HashMap<String, usize> = HashMap::new();
-        let file = File::open(&self.db_file_path)?;
-        let reader = BufReader::new(file);
-        let der = serde_json::Deserializer::from_reader(reader);
-        let mut iter = der.into_iter::<Record>();
+
+        let mut iter =
+            serde_json::Deserializer::from_reader(BufReader::new(File::open(&self.db_file_path)?))
+                .into_iter::<Record>();
 
         loop {
             let offset = iter.byte_offset();
@@ -152,10 +167,8 @@ impl KvStore {
     fn get_value_by_offset(&self, offset: &usize) -> Result<Option<String>> {
         let mut file = File::open(&self.db_file_path)?;
         file.seek(SeekFrom::Start(*offset as u64))?;
-        let reader = BufReader::new(file);
-        let der = serde_json::Deserializer::from_reader(reader);
-        let mut iter = der.into_iter::<Record>();
-        let record = iter
+        let record = serde_json::Deserializer::from_reader(BufReader::new(file))
+            .into_iter::<Record>()
             .next()
             .ok_or(KvsError::from("Unable to deserialize file".to_owned()))?;
         Ok(record?.value)
@@ -203,7 +216,7 @@ impl KvStore {
         }
 
         println!("before rename");
-        
+
         rename(&new_log_path, &self.db_file_path)?;
         Ok(())
     }
