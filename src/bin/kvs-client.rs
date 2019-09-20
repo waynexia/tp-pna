@@ -6,7 +6,7 @@ use std::process::exit;
 
 fn main() -> Result<()> {
     /* load clap config from yaml file */
-    let yaml = clap::load_yaml!("cli.yml");
+    let yaml = clap::load_yaml!("kvs-client-clap.yml");
     let matches = App::from_yaml(yaml)
         .name(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))

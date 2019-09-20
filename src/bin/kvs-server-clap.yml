@@ -1,0 +1,17 @@
+# clap config file for binary project kvs-server
+name: kvs-server
+args: 
+    - addr:
+        long: addr
+        takes_value: true
+        value_names: IP:PORT
+        help: "Accepts an IP address, either v4 or v6, and a port number,
+            with the format IP:PORT. If --addr is not specified then connect 
+            on 127.0.0.1:4000."
+    - engine:
+        long: "engine"
+        takes_value: true
+        value_names: ENGINE-NAME
+        help: "Specify the engine to use. The value must be one of 'kvs' or 'sled'.
+            If this is the first run (there is no data previously persisted) then the default value is 'kvs'.
+            Or the default value is the engine already in use, and the given engine name should be that one."

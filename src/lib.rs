@@ -26,6 +26,11 @@ struct Record {
     value: Option<String>,
 }
 
+///
+pub struct KvsEngine{
+    
+}
+
 /// Used to create and operate a `KvStore` instance.
 pub struct KvStore {
     index: HashMap<String, usize>,
