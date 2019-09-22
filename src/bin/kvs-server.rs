@@ -1,5 +1,6 @@
 extern crate clap;
 use clap::App;
+use kvs::engine::KvsEngine;
 use kvs::{KvStore, KvsError, Protocol, Result};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -9,7 +10,6 @@ use std::path::Path;
 extern crate slog;
 extern crate slog_async;
 extern crate slog_term;
-
 use slog::Drain;
 
 #[derive(Serialize, Deserialize, Debug)]
