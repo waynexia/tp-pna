@@ -1,13 +1,15 @@
 extern crate clap;
 use clap::App;
-use kvs::Result;
+use kvs::{protocol_receive, protocol_send, KvStore, KvsError, Result};
 use serde::{Deserialize, Serialize};
-use std::net::{TcpListener, TcpStream};
+use std::error::Error;
 use std::io::prelude::*;
+use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 #[macro_use]
 extern crate slog;
-extern crate slog_term;
 extern crate slog_async;
+extern crate slog_term;
 
 use slog::Drain;
 
@@ -42,21 +44,47 @@ fn main() -> Result<()> {
     let log = slog::Logger::root(drain, o!());
 
     info!(log, "start");
+
+    let mut kvstore = KvStore::open(&Path::new("./"))?;
     // debug!(log, "debug");
     // warn!(log, "warn");
     let listener = TcpListener::bind("127.0.0.1:4000")?;
-    for stream in listener.incoming() {
-        let mut s = stream?;
-        let mut buf = vec![0,8];
-        println!("received!");
-        s.read_exact(&mut buf)?;
-        let len :usize = serde_json::from_slice(&buf)?;
-        buf.resize(len,0);
-        s.read_exact(&mut buf);
-        let something : Command = serde_json::from_slice(&buf)?;
-        info!(log,"{:?}",something);
-        s.write(&buf)?;
+    for s in listener.incoming() {
+        let mut stream = s?;
+        let command: Command = protocol_receive(&mut stream)?;
+        info!(log, "received command {:?}", command);
+
+        let mut ret_str = String::new();
+        match command.op {
+            OpType::Get => {
+                match kvstore.get(command.key.to_owned())? {
+                    Some(value) => ret_str.push_str(&format!("+{}", value)),
+                    None => ret_str.push_str("-Key not found"),
+                };
+            }
+            OpType::Set => {
+                kvstore.set(command.key.to_owned(), command.value.unwrap().to_owned())?;
+                ret_str.push_str("*Done");
+            }
+            OpType::Remove => {
+                match kvstore.remove(command.key.to_owned()) {
+                    Err(KvsError::KeyNotFound) => {
+                        ret_str.push_str("-Key not found");
+                    }
+                    Ok(()) => {}
+                    Err(e) => ret_str.push_str(&format!("-{}", e.description())),
+                };
+            }
+        }
+
+        info!(log, "will be returned {}", ret_str);
+        protocol_send(&mut stream, &ret_str)?;
     }
 
     Ok(())
 }
+/*
++ for result
+- for error message
+* for system message
+*/

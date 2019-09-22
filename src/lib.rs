@@ -9,7 +9,9 @@ use std::fs::{metadata, rename, File, OpenOptions};
 use std::io::{prelude::*, BufReader, SeekFrom};
 
 mod error;
+mod protocol;
 pub use error::{KvsError, Result};
+pub use protocol::{protocol_receive, protocol_send};
 use std::path::Path;
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -27,9 +29,7 @@ struct Record {
 }
 
 ///
-pub struct KvsEngine{
-    
-}
+pub struct KvsEngine {}
 
 /// Used to create and operate a `KvStore` instance.
 pub struct KvStore {

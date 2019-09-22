@@ -13,6 +13,7 @@ serde_bytes = "0.11.2"
 slog = "2.5.2"
 slog-term = "2.4.1"
 slog-async = "2.3.0"
+bincode = "1.1.4"
 
 [dev-dependencies]
 assert_cmd = "0.11"
