@@ -1,10 +1,9 @@
 extern crate clap;
 use clap::App;
-use kvs::{protocol_receive, protocol_send, KvStore, KvsError, Result};
+use kvs::{KvStore, KvsError, Result,Protocol};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
-use std::io::prelude::*;
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::Path;
 #[macro_use]
 extern crate slog;
@@ -51,7 +50,8 @@ fn main() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:4000")?;
     for s in listener.incoming() {
         let mut stream = s?;
-        let command: Command = protocol_receive(&mut stream)?;
+        let mut protocol = Protocol::new(&mut stream);
+        let command :Command = protocol.receive()?;
         info!(log, "received command {:?}", command);
 
         let mut ret_str = String::new();
@@ -78,7 +78,7 @@ fn main() -> Result<()> {
         }
 
         info!(log, "will be returned {}", ret_str);
-        protocol_send(&mut stream, &ret_str)?;
+        protocol.send(&ret_str)?;
     }
 
     Ok(())

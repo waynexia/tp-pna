@@ -1,12 +1,9 @@
 extern crate bincode;
 extern crate clap;
 use clap::App;
-use kvs::{protocol_receive, protocol_send, KvStore, KvsError, Result};
+use kvs::{ Protocol, Result};
 use serde::{Deserialize, Serialize};
-use std::io::prelude::*;
 use std::net::TcpStream;
-use std::path::Path;
-use std::process::exit;
 
 #[derive(Serialize, Deserialize, Debug)]
 enum OpType {
@@ -31,8 +28,6 @@ fn main() -> Result<()> {
         .author(env!("CARGO_PKG_AUTHORS"))
         .about(env!("CARGO_PKG_DESCRIPTION"))
         .get_matches();
-
-    let mut kvstore = KvStore::open(&Path::new("./"))?;
 
     let mut command = Command {
         op: OpType::Get,
@@ -71,9 +66,9 @@ fn main() -> Result<()> {
     }
 
     let mut stream = TcpStream::connect(&addr)?;
-    protocol_send(&mut stream, &command)?;
+    let mut protocol = Protocol::new(&mut stream);
+    let de: String = protocol.send(&command)?.receive()?;
 
-    let de: String = protocol_receive(&mut stream)?;
     println!("{:?}", de);
 
     Ok(())
