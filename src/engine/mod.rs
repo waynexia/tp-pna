@@ -3,7 +3,9 @@
 use crate::error::Result;
 
 mod kvstore;
+mod sledEngine;
 pub use kvstore::KvStore;
+pub use sledEngine::SledKvsEngine;
 
 ///
 pub trait KvsEngine {

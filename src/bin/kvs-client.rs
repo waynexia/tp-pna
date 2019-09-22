@@ -35,7 +35,7 @@ fn main() -> Result<()> {
         key: String::new(),
         value: None,
     };
-    let mut addr: String;
+    let addr: String;
 
     match matches.subcommand() {
         ("get", Some(sub_m)) => {

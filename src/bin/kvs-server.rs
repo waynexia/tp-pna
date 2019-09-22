@@ -1,9 +1,10 @@
 extern crate clap;
 use clap::App;
 use kvs::engine::KvsEngine;
-use kvs::{KvStore, KvsError, Protocol, Result};
+use kvs::{KvStore, KvsError, Protocol, Result, SledKvsEngine};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
+use std::fs::File;
 use std::net::TcpListener;
 use std::path::Path;
 #[macro_use]
@@ -45,17 +46,32 @@ fn main() -> Result<()> {
     info!(log, "start");
 
     let addr = matches.value_of("addr").unwrap_or("127.0.0.1:4000");
-    let mut kvstore = KvStore::open(&Path::new("./"))?;
+    let default_engine_name = get_default_engine();
+    let engine_name = matches.value_of("engine").unwrap_or(&default_engine_name);
+    setup_engine_flag(&engine_name);
+    // let mut store = KvStore::open(&Path::new("./"))?;
+    // let mut store = SledKvsEngine::open(&Path::new("./"))?;
     info!(
         log,
-        "{} (ver {}) start listening on {}",
+        "{} (ver {}), engine: {}, start listening on {}",
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION"),
+        engine_name,
         addr
     );
-    // debug!(log, "debug");
-    // warn!(log, "warn");
-    let listener = TcpListener::bind(&addr)?;
+
+    match engine_name {
+        "kvs" => run(KvStore::open(&Path::new("./"))?, addr, log)?,
+        "sled" => run(SledKvsEngine::open(&std::env::current_dir()?)?, addr, log)?,
+        _ => panic!("invalid engine name, must be kvs or sled!"),
+    }
+
+    Ok(())
+}
+
+fn run<T: KvsEngine>(mut store: T, addr: &str, log: slog::Logger) -> Result<()> {
+    // info!(log, "current dir: {:?}",std::env::current_dir()?);
+    let listener = TcpListener::bind(addr)?;
     for s in listener.incoming() {
         let mut stream = s?;
         let mut protocol = Protocol::new(&mut stream);
@@ -65,17 +81,17 @@ fn main() -> Result<()> {
         let mut ret_str = String::new();
         match command.op {
             OpType::Get => {
-                match kvstore.get(command.key.to_owned())? {
+                match store.get(command.key.to_owned())? {
                     Some(value) => ret_str.push_str(&format!("+{}", value)),
                     None => ret_str.push_str("-Key not found"),
                 };
             }
             OpType::Set => {
-                kvstore.set(command.key.to_owned(), command.value.unwrap().to_owned())?;
+                store.set(command.key.to_owned(), command.value.unwrap().to_owned())?;
                 ret_str.push_str("*Done");
             }
             OpType::Remove => {
-                match kvstore.remove(command.key.to_owned()) {
+                match store.remove(command.key.to_owned()) {
                     Err(KvsError::KeyNotFound) => {
                         ret_str.push_str("-Key not found");
                     }
@@ -84,10 +100,38 @@ fn main() -> Result<()> {
                 };
             }
         }
-
         info!(log, "execute result: {}", ret_str);
         protocol.send(&ret_str)?;
     }
-
     Ok(())
+}
+
+fn get_default_engine() -> String {
+    if Path::new("./").join(".sled_flag").exists() {
+        return "sled".to_owned();
+    } else {
+        return "kvs".to_owned();
+    }
+}
+
+fn setup_engine_flag(engine_name: &str) {
+    match engine_name {
+        "kvs" => {
+            if Path::new("./.sled_flag").exists() {
+                panic!("different engine than previously used");
+            }
+            if !Path::new("./.kvs_flag").exists() {
+                File::create(&Path::new("./.kvs_flag")).unwrap();
+            }
+        }
+        "sled" => {
+            if Path::new("./.kvs_flag").exists() {
+                panic!("different engine than previously used");
+            }
+            if !Path::new("./.sled_flag").exists() {
+                File::create(&Path::new("./.sled_flag")).unwrap();
+            }
+        }
+        _ => panic!(),
+    }
 }

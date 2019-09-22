@@ -8,6 +8,6 @@ pub mod engine;
 mod error;
 mod protocol;
 
-pub use engine::{KvStore, KvsEngine};
+pub use engine::{KvStore, KvsEngine, SledKvsEngine};
 pub use error::{KvsError, Result};
 pub use protocol::{Protocol, Status};
