@@ -1,11 +1,12 @@
 extern crate bincode;
 extern crate clap;
 use clap::App;
-use kvs::{ Protocol, Result};
+use kvs::{Protocol, Result, Status};
 use serde::{Deserialize, Serialize};
 use std::net::TcpStream;
+use std::process::exit;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 enum OpType {
     Set,
     Get,
@@ -34,7 +35,7 @@ fn main() -> Result<()> {
         key: String::new(),
         value: None,
     };
-    let mut addr = String::new();
+    let mut addr: String;
 
     match matches.subcommand() {
         ("get", Some(sub_m)) => {
@@ -68,8 +69,19 @@ fn main() -> Result<()> {
     let mut stream = TcpStream::connect(&addr)?;
     let mut protocol = Protocol::new(&mut stream);
     let de: String = protocol.send(&command)?.receive()?;
-
-    println!("{:?}", de);
+    let (status, result) = Protocol::parse_result(&de)?;
+    match status {
+        Status::Ok => println!("{}", result),
+        Status::Error => {
+            if command.op == OpType::Remove {
+                eprintln!("Error: {}", result);
+                exit(1);
+            } else {
+                println!("Error: {}", result);
+            }
+        }
+        Status::Message => {}
+    }
 
     Ok(())
 }

@@ -19,6 +19,16 @@ struct Command {
 }
 
 ///
+pub enum Status {
+    ///
+    Ok,
+    ///
+    Error,
+    ///
+    Message,
+}
+
+///
 pub struct Protocol<'a> {
     stream: &'a TcpStream,
 }
@@ -35,7 +45,6 @@ impl<'a> Protocol<'a> {
         let len = bincode::serialize(&serialized.len()).unwrap();
         self.stream.write(&len)?;
         self.stream.write(&serialized)?;
-        println!("sended!");
         Ok(self)
     }
 
@@ -45,14 +54,21 @@ impl<'a> Protocol<'a> {
         for<'de> T: Deserialize<'de>,
     {
         let mut rcv_message = vec![0; 8];
-        println!("{:?}", rcv_message);
         self.stream.read_exact(&mut rcv_message)?;
-        println!("{:?}", rcv_message);
         let len: usize = bincode::deserialize(&rcv_message).unwrap();
-        println!("{}", len);
         rcv_message.resize(len, 0);
         self.stream.read_exact(&mut rcv_message)?;
         let de: T = bincode::deserialize(&rcv_message).unwrap();
         Ok(de)
+    }
+
+    ///
+    pub fn parse_result(result: &str) -> Result<(Status, String)> {
+        match result.chars().nth(0) {
+            Some('+') => return Ok((Status::Ok, result.get(1..).unwrap().to_string())),
+            Some('-') => return Ok((Status::Error, result.get(1..).unwrap().to_string())),
+            Some('*') => return Ok((Status::Message, result.get(1..).unwrap().to_string())),
+            _ => unreachable!(),
+        }
     }
 }

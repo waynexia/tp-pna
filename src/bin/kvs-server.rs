@@ -1,6 +1,6 @@
 extern crate clap;
 use clap::App;
-use kvs::{KvStore, KvsError, Result,Protocol};
+use kvs::{KvStore, KvsError, Protocol, Result};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::net::TcpListener;
@@ -29,14 +29,14 @@ struct Command {
 fn main() -> Result<()> {
     /* load clap config from yaml file */
     let yaml = clap::load_yaml!("kvs-server-clap.yml");
-    let _matches = App::from_yaml(yaml)
+    let matches = App::from_yaml(yaml)
         .name(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))
         .author(env!("CARGO_PKG_AUTHORS"))
         .about(env!("CARGO_PKG_DESCRIPTION"))
         .get_matches();
 
-    let decorator = slog_term::PlainDecorator::new(std::io::stdout());
+    let decorator = slog_term::PlainDecorator::new(std::io::stderr());
     let drain = slog_term::FullFormat::new(decorator).build().fuse();
     let drain = slog_async::Async::new(drain).build().fuse();
 
@@ -44,14 +44,22 @@ fn main() -> Result<()> {
 
     info!(log, "start");
 
+    let addr = matches.value_of("addr").unwrap_or("127.0.0.1:4000");
     let mut kvstore = KvStore::open(&Path::new("./"))?;
+    info!(
+        log,
+        "{} (ver {}) start listening on {}",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+        addr
+    );
     // debug!(log, "debug");
     // warn!(log, "warn");
-    let listener = TcpListener::bind("127.0.0.1:4000")?;
+    let listener = TcpListener::bind(&addr)?;
     for s in listener.incoming() {
         let mut stream = s?;
         let mut protocol = Protocol::new(&mut stream);
-        let command :Command = protocol.receive()?;
+        let command: Command = protocol.receive()?;
         info!(log, "received command {:?}", command);
 
         let mut ret_str = String::new();
@@ -71,20 +79,15 @@ fn main() -> Result<()> {
                     Err(KvsError::KeyNotFound) => {
                         ret_str.push_str("-Key not found");
                     }
-                    Ok(()) => {}
+                    Ok(()) => ret_str.push_str("*Done"),
                     Err(e) => ret_str.push_str(&format!("-{}", e.description())),
                 };
             }
         }
 
-        info!(log, "will be returned {}", ret_str);
+        info!(log, "execute result: {}", ret_str);
         protocol.send(&ret_str)?;
     }
 
     Ok(())
 }
-/*
-+ for result
-- for error message
-* for system message
-*/

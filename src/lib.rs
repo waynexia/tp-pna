@@ -11,7 +11,7 @@ use std::io::{prelude::*, BufReader, SeekFrom};
 mod error;
 mod protocol;
 pub use error::{KvsError, Result};
-pub use protocol::Protocol;
+pub use protocol::{Protocol, Status};
 use std::path::Path;
 
 #[derive(Serialize, Deserialize, Debug)]
