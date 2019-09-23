@@ -1,24 +1,9 @@
 extern crate bincode;
 extern crate clap;
 use clap::App;
-use kvs::{Protocol, Result, Status};
-use serde::{Deserialize, Serialize};
+use kvs::{Result, Status,Protocol, Command, OpType};
 use std::net::TcpStream;
 use std::process::exit;
-
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
-enum OpType {
-    Set,
-    Get,
-    Remove,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct Command {
-    op: OpType,
-    key: String,
-    value: Option<String>,
-}
 
 fn main() -> Result<()> {
     /* load clap config from yaml file */

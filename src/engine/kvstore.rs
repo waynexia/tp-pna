@@ -1,4 +1,3 @@
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{metadata, rename, File, OpenOptions};
 use std::io::{prelude::*, BufReader, SeekFrom};
@@ -6,45 +5,32 @@ use std::path::Path;
 
 use super::KvsEngine;
 use crate::error::{KvsError, Result};
-
-#[derive(Serialize, Deserialize, Debug)]
-enum OpType {
-    Set,
-    Get,
-    Remove,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct Record {
-    op: OpType,
-    key: String,
-    value: Option<String>,
-}
+use crate::protocol::{Command, OpType};
 
 /// KvStore handle.
 /// KvStore is a key-value stroage based on kvs engine.
 ///
 /// # Example
 /// ```rust
-/// use kvs::KvStore;
+/// use kvs::{KvStore,KvsEngine};
 /// use tempfile::TempDir;
 ///
 /// // open a KvStore
 /// let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-/// let mut store = KvStore::open(temp_dir.path())?;
+/// let mut store = KvStore::open(temp_dir.path()).unwrap();
 ///
 /// // set and get data
-/// store.set("key1".to_owned(), "value1".to_owned())?;
-/// assert_eq!(store.get("key1".to_owned())?, Some("value1".to_owned()));
+/// store.set("key1".to_owned(), "value1".to_owned()).unwrap();
+/// assert_eq!(store.get("key1".to_owned()).unwrap(), Some("value1".to_owned()));
 ///
 /// // re-open then check data
 /// drop(store);
-/// let mut store = KvStore::open(temp_dir.path())?;
-/// assert_eq!(store.get("key1".to_owned())?, Some("value1".to_owned()));
+/// let mut store = KvStore::open(temp_dir.path()).unwrap();
+/// assert_eq!(store.get("key1".to_owned()).unwrap(), Some("value1".to_owned()));
 ///
 /// // remove key-value pair
 /// assert!(store.remove("key1".to_owned()).is_ok());
-/// assert_eq!(store.get("key1".to_owned())?, None);
+/// assert_eq!(store.get("key1".to_owned()).unwrap(), None);
 /// ```
 pub struct KvStore {
     index: HashMap<String, usize>,
@@ -70,7 +56,7 @@ impl KvStore {
 
         let mut iter =
             serde_json::Deserializer::from_reader(BufReader::new(File::open(db_file_path)?))
-                .into_iter::<Record>();
+                .into_iter::<Command>();
 
         loop {
             let offset = iter.byte_offset();
@@ -95,13 +81,13 @@ impl KvStore {
         let mut file = File::open(&self.db_file_path)?;
         file.seek(SeekFrom::Start(*offset as u64))?;
         let record = serde_json::Deserializer::from_reader(BufReader::new(file))
-            .into_iter::<Record>()
+            .into_iter::<Command>()
             .next()
             .ok_or(KvsError::Undeserialized)?;
         Ok(record?.value)
     }
 
-    fn write_log(&self, record: Record) -> Result<usize> {
+    fn write_log(&self, record: Command) -> Result<usize> {
         /* try to use enviroment variable instead? */
         let log_size_limit = 10_0000;
 
@@ -118,7 +104,7 @@ impl KvStore {
     }
 
     /*
-        strategy: just copy log entry that still alive into a new file
+        strategy: copy log entry that still alive into a new file
         then use it to overwrite the old log file.
     */
     fn compact_log(&self) -> Result<()> {
@@ -131,7 +117,7 @@ impl KvStore {
         for (_, offset) in self.index.iter() {
             in_file.seek(SeekFrom::Start(*offset as u64))?;
             let record = serde_json::Deserializer::from_reader(BufReader::new(&in_file))
-                .into_iter::<Record>()
+                .into_iter::<Command>()
                 .next()
                 .ok_or(KvsError::Undeserialized)?;
             serde_json::to_writer(&mut out_file, &record?)?;
@@ -150,7 +136,7 @@ impl KvsEngine for KvStore {
     }
 
     fn set(&mut self, key: String, value: String) -> Result<()> {
-        let record = Record {
+        let record = Command {
             op: OpType::Set,
             key: key.clone(),
             value: Some(value),
@@ -162,7 +148,7 @@ impl KvsEngine for KvStore {
 
     fn remove(&mut self, key: String) -> Result<()> {
         self.index.get(&key).ok_or(KvsError::KeyNotFound)?;
-        let record = Record {
+        let record = Command {
             op: OpType::Remove,
             key: key.clone(),
             value: None,

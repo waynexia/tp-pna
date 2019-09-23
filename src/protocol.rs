@@ -1,30 +1,41 @@
 extern crate bincode;
 use crate::error::Result;
 use serde::{Deserialize, Serialize};
+use std::cmp::PartialEq;
 use std::io::prelude::*;
 use std::net::TcpStream;
 
-#[derive(Serialize, Deserialize, Debug)]
-enum OpType {
+/// Stands for three possible operations defined in `KvsEngine`
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+pub enum OpType {
+    /// For `set` operation
     Set,
+    /// For `get` operation
     Get,
+    /// For `rm` or `remove` operation
     Remove,
 }
 
+/// Command body struct
 #[derive(Serialize, Deserialize, Debug)]
-struct Command {
-    op: OpType,
-    key: String,
-    value: Option<String>,
+pub struct Command {
+    /// Specify what current operation is
+    pub op: OpType,
+    /// The key in this command / operation. 
+    pub key: String,
+    /// The value. This field could be None as
+    /// `get` and `remove` opertaion need not to provide it.
+    pub value: Option<String>,
 }
 
-///
+/// This enum is used in server-to-client communication flow.
+/// Implies the status or execution result.
 pub enum Status {
-    ///
+    /// Command executes successfully
     Ok,
-    ///
+    /// A error is reported 
     Error,
-    ///
+    /// No error found, system sends some message
     Message,
 }
 
@@ -43,8 +54,6 @@ impl<'a> Protocol<'a> {
     }
 
     /// Send a serializable content.
-    ///
-    /// # Example
     pub fn send<T: Serialize>(&mut self, content: &T) -> Result<&'a mut Protocol> {
         let serialized = bincode::serialize(content).unwrap();
         let len = bincode::serialize(&serialized.len()).unwrap();
@@ -55,8 +64,6 @@ impl<'a> Protocol<'a> {
 
     /// To receive a object in given type.
     /// This function will block until read enough data.
-    ///
-    /// # Example
     pub fn receive<T>(&mut self) -> Result<T>
     where
         for<'de> T: Deserialize<'de>,
@@ -70,7 +77,7 @@ impl<'a> Protocol<'a> {
         Ok(de)
     }
 
-    ///
+    /// Parse the returned message from server for client.
     pub fn parse_result(result: &str) -> Result<(Status, String)> {
         match result.chars().nth(0) {
             Some('+') => return Ok((Status::Ok, result.get(1..).unwrap().to_string())),

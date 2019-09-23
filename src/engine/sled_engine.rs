@@ -12,23 +12,24 @@ use std::path::Path;
 /// ```rust
 /// use kvs::SledKvsEngine;
 /// use tempfile::TempDir;
+/// use crate::kvs::KvsEngine;
 ///
 /// // open a SledKvsEngine
 /// let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-/// let mut store = SledKvsEngine::open(temp_dir.path())?;
+/// let mut store = SledKvsEngine::open(temp_dir.path()).unwrap();
 ///
 /// // set and get data
-/// store.set("key1".to_owned(), "value1".to_owned())?;
-/// assert_eq!(store.get("key1".to_owned())?, Some("value1".to_owned()));
+/// store.set("key1".to_owned(), "value1".to_owned()).unwrap();
+/// assert_eq!(store.get("key1".to_owned()).unwrap(), Some("value1".to_owned()));
 ///
 /// // re-open then check data
 /// drop(store);
-/// let mut store = SledKvsEngine::open(temp_dir.path())?;
-/// assert_eq!(store.get("key1".to_owned())?, Some("value1".to_owned()));
+/// let mut store = SledKvsEngine::open(temp_dir.path()).unwrap();
+/// assert_eq!(store.get("key1".to_owned()).unwrap(), Some("value1".to_owned()));
 ///
 /// // remove key-value pair
 /// assert!(store.remove("key1".to_owned()).is_ok());
-/// assert_eq!(store.get("key1".to_owned())?, None);
+/// assert_eq!(store.get("key1".to_owned()).unwrap(), None);
 /// ```
 pub struct SledKvsEngine {
     db: Db,

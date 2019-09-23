@@ -1,4 +1,5 @@
-//!
+//! Mod `engine` provides trait `KvsEngine` and
+//! two implementations.
 
 use crate::error::Result;
 
