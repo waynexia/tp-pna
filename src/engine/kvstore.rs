@@ -23,25 +23,25 @@ struct Record {
 
 /// KvStore handle.
 /// KvStore is a key-value stroage based on kvs engine.
-/// 
+///
 /// # Example
 /// ```rust
 /// use kvs::KvStore;
 /// use tempfile::TempDir;
-/// 
+///
 /// // open a KvStore
 /// let temp_dir = TempDir::new().expect("unable to create temporary working directory");
 /// let mut store = KvStore::open(temp_dir.path())?;
-/// 
+///
 /// // set and get data
 /// store.set("key1".to_owned(), "value1".to_owned())?;
 /// assert_eq!(store.get("key1".to_owned())?, Some("value1".to_owned()));
-/// 
+///
 /// // re-open then check data
 /// drop(store);
 /// let mut store = KvStore::open(temp_dir.path())?;
 /// assert_eq!(store.get("key1".to_owned())?, Some("value1".to_owned()));
-/// 
+///
 /// // remove key-value pair
 /// assert!(store.remove("key1".to_owned()).is_ok());
 /// assert_eq!(store.get("key1".to_owned())?, None);

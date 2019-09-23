@@ -9,11 +9,11 @@ pub use sled_engine::SledKvsEngine;
 
 /// The `KvsEngine` trait allows to access data in a key-value storage
 /// Struct which implemented this trait can be called `engine`.
-/// 
-/// A kvs(Key-Value Storage) engine's should support three operation: 
+///
+/// A kvs(Key-Value Storage) engine's should support three operation:
 /// `get`, `set` and `remove`. Both types of key and value are `String`.
 /// And return value is `Result<T,KvsError>`.
-/// 
+///
 /// # Example
 /// See document of KvStore or SledKvsEngine for example.
 pub trait KvsEngine {
