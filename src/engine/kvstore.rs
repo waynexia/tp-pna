@@ -21,24 +21,38 @@ struct Record {
     value: Option<String>,
 }
 
-/// Used to create and operate a `KvStore` instance.
+/// KvStore handle.
+/// KvStore is a key-value stroage based on kvs engine.
+/// 
+/// # Example
+/// ```rust
+/// use kvs::KvStore;
+/// use tempfile::TempDir;
+/// 
+/// // open a KvStore
+/// let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+/// let mut store = KvStore::open(temp_dir.path())?;
+/// 
+/// // set and get data
+/// store.set("key1".to_owned(), "value1".to_owned())?;
+/// assert_eq!(store.get("key1".to_owned())?, Some("value1".to_owned()));
+/// 
+/// // re-open then check data
+/// drop(store);
+/// let mut store = KvStore::open(temp_dir.path())?;
+/// assert_eq!(store.get("key1".to_owned())?, Some("value1".to_owned()));
+/// 
+/// // remove key-value pair
+/// assert!(store.remove("key1".to_owned()).is_ok());
+/// assert_eq!(store.get("key1".to_owned())?, None);
+/// ```
 pub struct KvStore {
     index: HashMap<String, usize>,
     db_file_path: Box<Path>,
 }
 
 impl KvStore {
-    /// Open a kvs located in given path.
-    /// If no log file existing here it will be created.
-    /// And if there is one, kvs will use it to recover previous status.
-    ///
-    /// # Example:
-    /// ```rust
-    /// use kvs::KvStore;
-    /// use std::path::Path;
-    ///
-    /// let mut kvs = KvStore::open(Path::new("./")).unwrap();
-    /// ```
+    /// Open or load a kvs engine located in given path.
     pub fn open(path: &Path) -> Result<KvStore> {
         let db_file_path = path.join(Path::new("record.db"));
         if !db_file_path.exists() {
@@ -88,7 +102,7 @@ impl KvStore {
     }
 
     fn write_log(&self, record: Record) -> Result<usize> {
-        // try to use enviroment variable instead?
+        /* try to use enviroment variable instead? */
         let log_size_limit = 10_0000;
 
         let mut size = metadata(&self.db_file_path)?.len();
@@ -103,8 +117,10 @@ impl KvStore {
         Ok(size as usize)
     }
 
-    // strategy: just copy log entry that still alive into a new file
-    // then use it to overwrite the old log file.
+    /*
+        strategy: just copy log entry that still alive into a new file
+        then use it to overwrite the old log file.
+    */
     fn compact_log(&self) -> Result<()> {
         let something = &format!("{}_compacted", self.db_file_path.to_str().unwrap());
         let new_log_path = Path::new(something);
@@ -126,40 +142,13 @@ impl KvStore {
     }
 }
 impl KvsEngine for KvStore {
-    /// Returns a value corresponding to the key.
-    ///
-    /// # Example:
-    /// ```rust
-    /// use kvs::KvStore;
-    /// use std::path::Path;
-    ///
-    /// let mut kvs = KvStore::open(Path::new("./")).unwrap();
-    /// kvs.set("key1".to_owned(), "value1".to_owned());
-    /// assert_eq!(kvs.get("key1".to_owned()).unwrap(), Some("value1".to_owned()));
-    /// assert_eq!(kvs.get("key2".to_owned()).unwrap(), None);
-    /// ```
     fn get(&mut self, key: String) -> Result<Option<String>> {
-        // maybe can use some combinator here
         self.get_value_by_offset(match self.index.get(&key) {
             Some(item) => item,
             None => return Ok(None),
         })
     }
 
-    /// Inserts a key-value pair into the store.
-    ///
-    /// # Example
-    /// ```rust
-    /// use kvs::KvStore;
-    /// use std::path::Path;
-    ///
-    /// let mut kvs = KvStore::open(Path::new("./")).unwrap();
-    /// kvs.set("key1".to_owned(), "value1".to_owned()).unwrap();
-    /// assert_eq!(kvs.get("key1".to_owned()).unwrap(), Some("value1".to_owned()));
-    ///
-    /// kvs.set("key1".to_owned(), "value2".to_owned()).unwrap();
-    /// assert_eq!(kvs.get("key1".to_owned()).unwrap(), Some("value2".to_owned()))
-    /// ```
     fn set(&mut self, key: String, value: String) -> Result<()> {
         let record = Record {
             op: OpType::Set,
@@ -171,18 +160,6 @@ impl KvsEngine for KvStore {
         Ok(())
     }
 
-    /// Removes a key from the map.
-    ///
-    /// # Example
-    /// ```rust
-    /// use kvs::KvStore;
-    /// use std::path::Path;
-    ///
-    /// let mut kvs = KvStore::open(Path::new("./")).unwrap();
-    /// kvs.set("key1".to_owned(), "value1".to_owned()).unwrap();
-    /// kvs.remove("key1".to_owned()).unwrap();
-    /// assert_eq!(kvs.get("key1".to_owned()).unwrap(),None);
-    /// ```
     fn remove(&mut self, key: String) -> Result<()> {
         self.index.get(&key).ok_or(KvsError::KeyNotFound)?;
         let record = Record {

@@ -28,18 +28,23 @@ pub enum Status {
     Message,
 }
 
-///
+/// This struct is for communication between kvs client and server.
+/// 
+/// It provieds basic `send` and `receive` function based on `std::net::TcpStream`.
+/// Command and result's constructor and parser are also included.
 pub struct Protocol<'a> {
     stream: &'a TcpStream,
 }
 
 impl<'a> Protocol<'a> {
-    ///
+    /// Create a protocol handle.
     pub fn new(stream: &mut TcpStream) -> Protocol {
         Protocol { stream }
     }
 
-    ///
+    /// Send a serializable content.
+    /// 
+    /// # Example
     pub fn send<T: Serialize>(&mut self, content: &T) -> Result<&'a mut Protocol> {
         let serialized = bincode::serialize(content).unwrap();
         let len = bincode::serialize(&serialized.len()).unwrap();
@@ -48,7 +53,10 @@ impl<'a> Protocol<'a> {
         Ok(self)
     }
 
-    ///
+    /// To receive a object in given type.
+    /// This function will block until read enough data.
+    /// 
+    /// # Example
     pub fn receive<T>(&mut self) -> Result<T>
     where
         for<'de> T: Deserialize<'de>,
@@ -62,7 +70,7 @@ impl<'a> Protocol<'a> {
         Ok(de)
     }
 
-    ///
+    /// 
     pub fn parse_result(result: &str) -> Result<(Status, String)> {
         match result.chars().nth(0) {
             Some('+') => return Ok((Status::Ok, result.get(1..).unwrap().to_string())),

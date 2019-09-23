@@ -13,11 +13,11 @@ pub enum KvsError {
     Serde(serde_json_error::Error),
     /// Cannot find a given key in store
     KeyNotFound,
-    /// Cannot deserialize something in log file
+    /// Cannot deserialize log file
     Undeserialized,
 }
 
-/// Result alias
+/// Kvs result alias
 pub type Result<T> = result::Result<T, KvsError>;
 
 impl fmt::Display for KvsError {

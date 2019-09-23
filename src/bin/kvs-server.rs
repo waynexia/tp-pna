@@ -49,8 +49,6 @@ fn main() -> Result<()> {
     let default_engine_name = get_default_engine();
     let engine_name = matches.value_of("engine").unwrap_or(&default_engine_name);
     setup_engine_flag(&engine_name);
-    // let mut store = KvStore::open(&Path::new("./"))?;
-    // let mut store = SledKvsEngine::open(&Path::new("./"))?;
     info!(
         log,
         "{} (ver {}), engine: {}, start listening on {}",
@@ -70,7 +68,6 @@ fn main() -> Result<()> {
 }
 
 fn run<T: KvsEngine>(mut store: T, addr: &str, log: slog::Logger) -> Result<()> {
-    // info!(log, "current dir: {:?}",std::env::current_dir()?);
     let listener = TcpListener::bind(addr)?;
     for s in listener.incoming() {
         let mut stream = s?;
