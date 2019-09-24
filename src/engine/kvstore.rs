@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs::{metadata, rename, File, OpenOptions};
 use std::io::{prelude::*, BufReader, SeekFrom};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use super::KvsEngine;
 use crate::error::{KvsError, Result};
@@ -32,9 +33,11 @@ use crate::protocol::{Command, OpType};
 /// assert!(store.remove("key1".to_owned()).is_ok());
 /// assert_eq!(store.get("key1".to_owned()).unwrap(), None);
 /// ```
+#[derive(Clone)]
 pub struct KvStore {
-    index: HashMap<String, usize>,
-    db_file_path: Box<Path>,
+    index_keeper: Arc<Mutex<HashMap<String, usize>>>,
+    // db_file_path: Box<Path>,
+    file_handle_keeper: Arc<Mutex<DBFileHandle>>,
 }
 
 impl KvStore {
@@ -44,19 +47,78 @@ impl KvStore {
         if !db_file_path.exists() {
             File::create(&db_file_path)?;
         }
-        let index = KvStore::build_index(&db_file_path)?;
+        // let index = KvStore::build_index(&db_file_path)?;
+        let file_handle = DBFileHandle {
+            file_path: Box::from(db_file_path),
+        };
+        let index = file_handle.build_index()?;
         Ok(KvStore {
-            index,
-            db_file_path: Box::from(db_file_path),
+            index_keeper: Arc::new(Mutex::new(index)),
+            file_handle_keeper: Arc::new(Mutex::new(file_handle)),
+        })
+    }
+}
+impl KvsEngine for KvStore {
+    fn get(&self, key: String) -> Result<Option<String>> {
+        let file_handle_locker = Arc::clone(&self.file_handle_keeper);
+        let file_handle = file_handle_locker.lock().unwrap();
+        let index_locker = Arc::clone(&self.index_keeper);
+        let index = index_locker.lock().unwrap();
+
+        file_handle.get_value_by_offset(match index.get(&key) {
+            Some(item) => item,
+            None => return Ok(None),
         })
     }
 
-    fn build_index(db_file_path: &Path) -> Result<HashMap<String, usize>> {
+    fn set(&self, key: String, value: String) -> Result<()> {
+        let record = Command {
+            op: OpType::Set,
+            key: key.clone(),
+            value: Some(value),
+        };
+
+        let file_handle_locker = Arc::clone(&self.file_handle_keeper);
+        let file_handle = file_handle_locker.lock().unwrap();
+        let index_locker = Arc::clone(&self.index_keeper);
+        let mut index = index_locker.lock().unwrap();
+
+        let offset = file_handle.write_log(record, &index)?;
+        index.insert(key, offset);
+        Ok(())
+    }
+
+    fn remove(&self, key: String) -> Result<()> {
+        let file_handle_locker = Arc::clone(&self.file_handle_keeper);
+        let file_handle = file_handle_locker.lock().unwrap();
+        let index_locker = Arc::clone(&self.index_keeper);
+        let mut index = index_locker.lock().unwrap();
+
+        index.get(&key).ok_or(KvsError::KeyNotFound)?;
+        let record = Command {
+            op: OpType::Remove,
+            key: key.clone(),
+            value: None,
+        };
+        file_handle.write_log(record, &index)?;
+        index.remove(&key);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct DBFileHandle {
+    file_path: Box<Path>,
+}
+
+impl DBFileHandle {
+    pub fn build_index(&self) -> Result<HashMap<String, usize>> {
         let mut index: HashMap<String, usize> = HashMap::new();
 
-        let mut iter =
-            serde_json::Deserializer::from_reader(BufReader::new(File::open(db_file_path)?))
-                .into_iter::<Command>();
+        let mut iter = serde_json::Deserializer::from_reader(BufReader::new(File::open(
+            self.file_path.to_owned(),
+        )?))
+        .into_iter::<Command>();
 
         loop {
             let offset = iter.byte_offset();
@@ -77,8 +139,8 @@ impl KvStore {
         Ok(index)
     }
 
-    fn get_value_by_offset(&self, offset: &usize) -> Result<Option<String>> {
-        let mut file = File::open(&self.db_file_path)?;
+    pub fn get_value_by_offset(&self, offset: &usize) -> Result<Option<String>> {
+        let mut file = File::open(&self.file_path)?;
         file.seek(SeekFrom::Start(*offset as u64))?;
         let record = serde_json::Deserializer::from_reader(BufReader::new(file))
             .into_iter::<Command>()
@@ -87,17 +149,17 @@ impl KvStore {
         Ok(record?.value)
     }
 
-    fn write_log(&self, record: Command) -> Result<usize> {
+    pub fn write_log(&self, record: Command, index: &HashMap<String, usize>) -> Result<usize> {
         /* try to use enviroment variable instead? */
         let log_size_limit = 10_0000;
 
-        let mut size = metadata(&self.db_file_path)?.len();
+        let mut size = metadata(&self.file_path)?.len();
         if size > log_size_limit {
-            self.compact_log()?;
-            size = metadata(&self.db_file_path)?.len();
+            self.compact_log(index)?;
+            size = metadata(&self.file_path)?.len();
         }
 
-        let mut file = OpenOptions::new().append(true).open(&self.db_file_path)?;
+        let mut file = OpenOptions::new().append(true).open(&self.file_path)?;
         serde_json::to_writer(&mut file, &record)?;
 
         Ok(size as usize)
@@ -107,14 +169,14 @@ impl KvStore {
         strategy: copy log entry that still alive into a new file
         then use it to overwrite the old log file.
     */
-    fn compact_log(&self) -> Result<()> {
-        let something = &format!("{}_compacted", self.db_file_path.to_str().unwrap());
+    pub fn compact_log(&self, index: &HashMap<String, usize>) -> Result<()> {
+        let something = &format!("{}_compacted", self.file_path.to_str().unwrap());
         let new_log_path = Path::new(something);
         File::create(&new_log_path)?;
         let mut out_file = OpenOptions::new().append(true).open(new_log_path)?;
-        let mut in_file = File::open(&self.db_file_path)?;
+        let mut in_file = File::open(&self.file_path)?;
 
-        for (_, offset) in self.index.iter() {
+        for (_, offset) in index.iter() {
             in_file.seek(SeekFrom::Start(*offset as u64))?;
             let record = serde_json::Deserializer::from_reader(BufReader::new(&in_file))
                 .into_iter::<Command>()
@@ -123,38 +185,7 @@ impl KvStore {
             serde_json::to_writer(&mut out_file, &record?)?;
         }
 
-        rename(&new_log_path, &self.db_file_path)?;
-        Ok(())
-    }
-}
-impl KvsEngine for KvStore {
-    fn get(&mut self, key: String) -> Result<Option<String>> {
-        self.get_value_by_offset(match self.index.get(&key) {
-            Some(item) => item,
-            None => return Ok(None),
-        })
-    }
-
-    fn set(&mut self, key: String, value: String) -> Result<()> {
-        let record = Command {
-            op: OpType::Set,
-            key: key.clone(),
-            value: Some(value),
-        };
-        let offset = self.write_log(record)?;
-        self.index.insert(key, offset);
-        Ok(())
-    }
-
-    fn remove(&mut self, key: String) -> Result<()> {
-        self.index.get(&key).ok_or(KvsError::KeyNotFound)?;
-        let record = Command {
-            op: OpType::Remove,
-            key: key.clone(),
-            value: None,
-        };
-        self.write_log(record)?;
-        self.index.remove(&key);
+        rename(&new_log_path, &self.file_path)?;
         Ok(())
     }
 }

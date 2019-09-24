@@ -1,7 +1,7 @@
 extern crate bincode;
 extern crate clap;
 use clap::App;
-use kvs::{Result, Status,Protocol, Command, OpType};
+use kvs::{Command, OpType, Protocol, Result, Status};
 use std::net::TcpStream;
 use std::process::exit;
 

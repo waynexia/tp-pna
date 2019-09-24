@@ -17,20 +17,20 @@ pub use sled_engine::SledKvsEngine;
 ///
 /// # Example
 /// See document of KvStore or SledKvsEngine for example.
-pub trait KvsEngine {
+pub trait KvsEngine: Clone + Send + 'static {
     /// Returns a value corresponding to the key.
     ///
     /// # Error
     /// - Try to get a non-existent key should return Ok(None)
     /// - Only return Err for other inner unexpectation.
-    fn get(&mut self, key: String) -> Result<Option<String>>;
+    fn get(&self, key: String) -> Result<Option<String>>;
 
     /// Inserts a key-value pair into the store.
-    fn set(&mut self, key: String, value: String) -> Result<()>;
+    fn set(&self, key: String, value: String) -> Result<()>;
 
     /// Removes a key from the map.
     ///
     /// # Error
     /// Removing of a non-existent key is considered an error.
-    fn remove(&mut self, key: String) -> Result<()>;
+    fn remove(&self, key: String) -> Result<()>;
 }

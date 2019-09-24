@@ -67,7 +67,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run<T: KvsEngine>(mut store: T, addr: &str, log: slog::Logger) -> Result<()> {
+fn run<T: KvsEngine>(store: T, addr: &str, log: slog::Logger) -> Result<()> {
     let listener = TcpListener::bind(addr)?;
     for s in listener.incoming() {
         let mut stream = s?;

@@ -31,6 +31,7 @@ use std::path::Path;
 /// assert!(store.remove("key1".to_owned()).is_ok());
 /// assert_eq!(store.get("key1".to_owned()).unwrap(), None);
 /// ```
+#[derive(Clone)]
 pub struct SledKvsEngine {
     db: Db,
 }
@@ -45,7 +46,7 @@ impl SledKvsEngine {
 }
 
 impl KvsEngine for SledKvsEngine {
-    fn get(&mut self, key: String) -> Result<Option<String>> {
+    fn get(&self, key: String) -> Result<Option<String>> {
         match self.db.get(key.as_bytes())? {
             Some(value) => {
                 return Ok(Some(String::from_utf8(value.to_vec()).unwrap()));
@@ -53,12 +54,12 @@ impl KvsEngine for SledKvsEngine {
             None => return Ok(None),
         }
     }
-    fn set(&mut self, key: String, value: String) -> Result<()> {
+    fn set(&self, key: String, value: String) -> Result<()> {
         self.db.insert(key.as_bytes(), value.as_bytes())?;
         self.db.flush()?;
         Ok(())
     }
-    fn remove(&mut self, key: String) -> Result<()> {
+    fn remove(&self, key: String) -> Result<()> {
         match self.db.remove(key.as_bytes())? {
             Some(_) => {
                 self.db.flush()?;

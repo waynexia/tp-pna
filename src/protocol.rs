@@ -21,7 +21,7 @@ pub enum OpType {
 pub struct Command {
     /// Specify what current operation is
     pub op: OpType,
-    /// The key in this command / operation. 
+    /// The key in this command / operation.
     pub key: String,
     /// The value. This field could be None as
     /// `get` and `remove` opertaion need not to provide it.
@@ -33,7 +33,7 @@ pub struct Command {
 pub enum Status {
     /// Command executes successfully
     Ok,
-    /// A error is reported 
+    /// A error is reported
     Error,
     /// No error found, system sends some message
     Message,
