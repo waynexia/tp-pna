@@ -1,12 +1,13 @@
 extern crate clap;
 use clap::App;
 use kvs::engine::KvsEngine;
-use kvs::{KvStore, KvsError, Protocol, Result, SledKvsEngine};
+use kvs::{KvStore, KvsError, Protocol, Result, SledKvsEngine,ThreadPool};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs::File;
 use std::net::TcpListener;
 use std::path::Path;
+use std::sync::{Arc,Mutex};
 #[macro_use]
 extern crate slog;
 extern crate slog_async;
@@ -67,38 +68,45 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run<T: KvsEngine>(store: T, addr: &str, log: slog::Logger) -> Result<()> {
+fn run<T: KvsEngine>(raw_store: T, addr: &str, log_param: slog::Logger) -> Result<()> {
     let listener = TcpListener::bind(addr)?;
+    let log_keeper = Arc::new(Mutex::new(log_param));
+    let thread_pool = ThreadPool::new(10)?;
     for s in listener.incoming() {
-        let mut stream = s?;
-        let mut protocol = Protocol::new(&mut stream);
-        let command: Command = protocol.receive()?;
-        info!(log, "received command {:?}", command);
-
-        let mut ret_str = String::new();
-        match command.op {
-            OpType::Get => {
-                match store.get(command.key.to_owned())? {
-                    Some(value) => ret_str.push_str(&format!("+{}", value)),
-                    None => ret_str.push_str("-Key not found"),
-                };
+        let log_locker = log_keeper.clone();
+        let store = raw_store.clone();
+        
+        thread_pool.spawn(move ||{
+            let log = log_locker.lock().unwrap();
+            let mut stream = s.unwrap();
+            let mut protocol = Protocol::new(&mut stream);
+            let command: Command = protocol.receive().unwrap();
+            info!(log, "received command {:?}", command);
+            let mut ret_str = String::new();
+            match command.op {
+                OpType::Get => {
+                    match store.get(command.key.to_owned()).unwrap() {
+                        Some(value) => ret_str.push_str(&format!("+{}", value)),
+                        None => ret_str.push_str("-Key not found"),
+                    };
+                }
+                OpType::Set => {
+                    store.set(command.key.to_owned(), command.value.unwrap().to_owned()).unwrap();
+                    ret_str.push_str("*Done");
+                }
+                OpType::Remove => {
+                    match store.remove(command.key.to_owned()) {
+                        Err(KvsError::KeyNotFound) => {
+                            ret_str.push_str("-Key not found");
+                        }
+                        Ok(()) => ret_str.push_str("*Done"),
+                        Err(e) => ret_str.push_str(&format!("-{}", e.description())),
+                    };
+                }
             }
-            OpType::Set => {
-                store.set(command.key.to_owned(), command.value.unwrap().to_owned())?;
-                ret_str.push_str("*Done");
-            }
-            OpType::Remove => {
-                match store.remove(command.key.to_owned()) {
-                    Err(KvsError::KeyNotFound) => {
-                        ret_str.push_str("-Key not found");
-                    }
-                    Ok(()) => ret_str.push_str("*Done"),
-                    Err(e) => ret_str.push_str(&format!("-{}", e.description())),
-                };
-            }
-        }
-        info!(log, "execute result: {}", ret_str);
-        protocol.send(&ret_str)?;
+            info!(log, "execute result: {}", ret_str);
+            protocol.send(&ret_str).unwrap();
+        });
     }
     Ok(())
 }
