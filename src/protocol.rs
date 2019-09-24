@@ -57,8 +57,8 @@ impl<'a> Protocol<'a> {
     pub fn send<T: Serialize>(&mut self, content: &T) -> Result<&'a mut Protocol> {
         let serialized = bincode::serialize(content).unwrap();
         let len = bincode::serialize(&serialized.len()).unwrap();
-        self.stream.write(&len)?;
-        self.stream.write(&serialized)?;
+        self.stream.write_all(&len)?;
+        self.stream.write_all(&serialized)?;
         Ok(self)
     }
 
