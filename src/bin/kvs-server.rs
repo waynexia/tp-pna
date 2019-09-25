@@ -1,13 +1,14 @@
 extern crate clap;
 use clap::App;
 use kvs::engine::KvsEngine;
-use kvs::{KvStore, KvsError, Protocol, Result, SledKvsEngine,ThreadPool};
+use kvs::{KvStore, KvsError, Protocol, Result, SledKvsEngine, ThreadPool};
+use num_cpus;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs::File;
 use std::net::TcpListener;
 use std::path::Path;
-use std::sync::{Arc,Mutex};
+use std::sync::{Arc, Mutex};
 #[macro_use]
 extern crate slog;
 extern crate slog_async;
@@ -71,12 +72,12 @@ fn main() -> Result<()> {
 fn run<T: KvsEngine>(raw_store: T, addr: &str, log_param: slog::Logger) -> Result<()> {
     let listener = TcpListener::bind(addr)?;
     let log_keeper = Arc::new(Mutex::new(log_param));
-    let thread_pool = ThreadPool::new(10)?;
+    let thread_pool = ThreadPool::new(num_cpus::get() as u32)?;
     for s in listener.incoming() {
         let log_locker = log_keeper.clone();
         let store = raw_store.clone();
-        
-        thread_pool.spawn(move ||{
+
+        thread_pool.spawn(move || {
             let log = log_locker.lock().unwrap();
             let mut stream = s.unwrap();
             let mut protocol = Protocol::new(&mut stream);
@@ -91,7 +92,9 @@ fn run<T: KvsEngine>(raw_store: T, addr: &str, log_param: slog::Logger) -> Resul
                     };
                 }
                 OpType::Set => {
-                    store.set(command.key.to_owned(), command.value.unwrap().to_owned()).unwrap();
+                    store
+                        .set(command.key.to_owned(), command.value.unwrap().to_owned())
+                        .unwrap();
                     ret_str.push_str("*Done");
                 }
                 OpType::Remove => {
