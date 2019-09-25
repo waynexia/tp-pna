@@ -1,9 +1,8 @@
 extern crate clap;
 use clap::App;
 use kvs::thread_pool::{SharedQueueThreadPool, ThreadPool};
-use kvs::{KvStore, KvsError, Protocol, Result, SledKvsEngine,KvsEngine};
+use kvs::{KvStore, KvsError, Protocol, Result, SledKvsEngine,KvsEngine,Command, OpType};
 use num_cpus;
-use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs::File;
 use std::net::TcpListener;
@@ -15,19 +14,7 @@ extern crate slog_async;
 extern crate slog_term;
 use slog::Drain;
 
-#[derive(Serialize, Deserialize, Debug)]
-enum OpType {
-    Set,
-    Get,
-    Remove,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct Command {
-    op: OpType,
-    key: String,
-    value: Option<String>,
-}
+const DEFAULT_ADDR : &str = "127.0.0.1:4000";
 
 fn main() -> Result<()> {
     /* load clap config from yaml file */
@@ -42,12 +29,9 @@ fn main() -> Result<()> {
     let decorator = slog_term::PlainDecorator::new(std::io::stderr());
     let drain = slog_term::FullFormat::new(decorator).build().fuse();
     let drain = slog_async::Async::new(drain).build().fuse();
-
     let log = slog::Logger::root(drain, o!());
 
-    info!(log, "start");
-
-    let addr = matches.value_of("addr").unwrap_or("127.0.0.1:4000");
+    let addr = matches.value_of("addr").unwrap_or(DEFAULT_ADDR);
     let default_engine_name = get_default_engine();
     let engine_name = matches.value_of("engine").unwrap_or(&default_engine_name);
     setup_engine_flag(&engine_name);
@@ -116,9 +100,9 @@ fn run<T: KvsEngine>(raw_store: T, addr: &str, log_param: slog::Logger) -> Resul
 
 fn get_default_engine() -> String {
     if Path::new("./").join(".sled_flag").exists() {
-        return "sled".to_owned();
+        "sled".to_owned()
     } else {
-        return "kvs".to_owned();
+        "kvs".to_owned()
     }
 }
 

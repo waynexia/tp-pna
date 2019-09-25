@@ -5,6 +5,8 @@ use kvs::{Command, OpType, Protocol, Result, Status};
 use std::net::TcpStream;
 use std::process::exit;
 
+const DEFAULT_ADDR : &str = "127.0.0.1:4000";
+
 fn main() -> Result<()> {
     /* load clap config from yaml file */
     let yaml = clap::load_yaml!("kvs-client-clap.yml");
@@ -22,30 +24,30 @@ fn main() -> Result<()> {
     };
     let addr: String;
 
-    match matches.subcommand() {
-        ("get", Some(sub_m)) => {
-            command.key = sub_m.value_of("key").unwrap().to_owned();
-            addr = sub_m
+    /* parse common parts of args */
+    if let (_,Some(sub_m)) = matches.subcommand(){
+        addr = sub_m
                 .value_of("addr")
-                .unwrap_or("127.0.0.1:4000")
+                .unwrap_or(DEFAULT_ADDR)
                 .to_owned();
+        command.key = sub_m.value_of("key").unwrap().to_owned();
+    }
+    else{
+        eprintln!("Expect a sub command!");
+        exit(1);
+    }
+
+    match matches.subcommand() {
+        ("get", Some(_sub_m)) => {
+            /* OpType::Get is default value */
+            // command.op = OpType::Get;
         }
         ("set", Some(sub_m)) => {
             command.op = OpType::Set;
-            command.key = sub_m.value_of("key").unwrap().to_owned();
             command.value = Some(sub_m.value_of("value").unwrap().to_owned());
-            addr = sub_m
-                .value_of("addr")
-                .unwrap_or("127.0.0.1:4000")
-                .to_owned();
         }
-        ("rm", Some(sub_m)) => {
+        ("rm", Some(_sub_m)) => {
             command.op = OpType::Remove;
-            command.key = sub_m.value_of("key").unwrap().to_owned();
-            addr = sub_m
-                .value_of("addr")
-                .unwrap_or("127.0.0.1:4000")
-                .to_owned();
         }
 
         _ => unreachable!(),
@@ -53,8 +55,8 @@ fn main() -> Result<()> {
 
     let mut stream = TcpStream::connect(&addr)?;
     let mut protocol = Protocol::new(&mut stream);
-    let de: String = protocol.send(&command)?.receive()?;
-    let (status, result) = Protocol::parse_result(&de)?;
+    let response: String = protocol.send(&command)?.receive()?;
+    let (status, result) = Protocol::parse_result(&response)?;
     match status {
         Status::Ok => println!("{}", result),
         Status::Error => {
