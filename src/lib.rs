@@ -6,12 +6,12 @@
 //! error type `KvsError` for error handle in this library
 //! and struct `Protocol` for client-server communication.
 
-pub mod engine;
+mod engine;
 mod error;
 mod protocol;
-mod thread_pool;
+pub mod thread_pool;
 
 pub use engine::{KvStore, KvsEngine, SledKvsEngine};
 pub use error::{KvsError, Result};
 pub use protocol::{Command, OpType, Protocol, Status};
-pub use thread_pool::ThreadPool;
+// pub use thread_pool;

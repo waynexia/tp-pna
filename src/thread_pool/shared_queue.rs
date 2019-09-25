@@ -3,15 +3,17 @@ use crossbeam::deque::{Steal, Stealer, Worker};
 use std::process::exit;
 use std::thread;
 
+use super::ThreadPool;
+
 ///
-pub struct ThreadPool {
+pub struct SharedQueueThreadPool {
     workers: Worker<ThreadPoolMessage>,
     join_handles: Vec<thread::JoinHandle<()>>,
 }
 
-impl ThreadPool {
+impl ThreadPool for SharedQueueThreadPool {
     ///
-    pub fn new(threads: u32) -> Result<ThreadPool> {
+    fn new(threads: u32) -> Result<SharedQueueThreadPool> {
         let workers = Worker::<ThreadPoolMessage>::new_fifo();
         let mut join_handles = Vec::new();
         for _ in 0..threads {
@@ -20,14 +22,14 @@ impl ThreadPool {
             join_handles.push(handle);
         }
 
-        Ok(ThreadPool {
+        Ok(SharedQueueThreadPool {
             workers,
             join_handles,
         })
     }
 
     ///
-    pub fn spawn<F>(&self, job: F)
+    fn spawn<F>(&self, job: F)
     where
         F: FnOnce() + Send + 'static,
     {
@@ -35,7 +37,7 @@ impl ThreadPool {
     }
 }
 
-impl Drop for ThreadPool {
+impl Drop for SharedQueueThreadPool {
     fn drop(&mut self) {
         for _ in 0..self.join_handles.len() {
             self.workers.push(ThreadPoolMessage::Shutdown);

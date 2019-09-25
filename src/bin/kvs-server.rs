@@ -1,7 +1,7 @@
 extern crate clap;
 use clap::App;
-use kvs::engine::KvsEngine;
-use kvs::{KvStore, KvsError, Protocol, Result, SledKvsEngine, ThreadPool};
+use kvs::thread_pool::{SharedQueueThreadPool, ThreadPool};
+use kvs::{KvStore, KvsError, Protocol, Result, SledKvsEngine,KvsEngine};
 use num_cpus;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -72,7 +72,7 @@ fn main() -> Result<()> {
 fn run<T: KvsEngine>(raw_store: T, addr: &str, log_param: slog::Logger) -> Result<()> {
     let listener = TcpListener::bind(addr)?;
     let log_keeper = Arc::new(Mutex::new(log_param));
-    let thread_pool = ThreadPool::new(num_cpus::get() as u32)?;
+    let thread_pool: SharedQueueThreadPool = ThreadPool::new(num_cpus::get() as u32)?;
     for s in listener.incoming() {
         let log_locker = log_keeper.clone();
         let store = raw_store.clone();
