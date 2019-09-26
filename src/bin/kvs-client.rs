@@ -5,7 +5,7 @@ use kvs::{Command, OpType, Protocol, Result, Status};
 use std::net::TcpStream;
 use std::process::exit;
 
-const DEFAULT_ADDR : &str = "127.0.0.1:4000";
+const DEFAULT_ADDR: &str = "127.0.0.1:4000";
 
 fn main() -> Result<()> {
     /* load clap config from yaml file */
@@ -25,14 +25,10 @@ fn main() -> Result<()> {
     let addr: String;
 
     /* parse common parts of args */
-    if let (_,Some(sub_m)) = matches.subcommand(){
-        addr = sub_m
-                .value_of("addr")
-                .unwrap_or(DEFAULT_ADDR)
-                .to_owned();
+    if let (_, Some(sub_m)) = matches.subcommand() {
+        addr = sub_m.value_of("addr").unwrap_or(DEFAULT_ADDR).to_owned();
         command.key = sub_m.value_of("key").unwrap().to_owned();
-    }
-    else{
+    } else {
         eprintln!("Expect a sub command!");
         exit(1);
     }

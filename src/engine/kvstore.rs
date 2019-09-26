@@ -1,12 +1,14 @@
 use std::collections::HashMap;
-use std::fs::{metadata, rename, File, OpenOptions};
+use std::fs::{create_dir_all, metadata, rename, File, OpenOptions};
 use std::io::{prelude::*, BufReader, SeekFrom};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::KvsEngine;
 use crate::error::{KvsError, Result};
 use crate::protocol::{Command, OpType};
+
+const MAX_REDUNDANCY: u64 = 1 << 16;
 
 /// KvStore handle.
 /// KvStore is a key-value stroage based on kvs engine.
@@ -45,11 +47,12 @@ impl KvStore {
     pub fn open(path: &Path) -> Result<KvStore> {
         let db_file_path = path.join(Path::new("record.db"));
         if !db_file_path.exists() {
+            create_dir_all(&path)?;
             File::create(&db_file_path)?;
         }
-        // let index = KvStore::build_index(&db_file_path)?;
         let file_handle = DBFileHandle {
             file_path: Box::from(db_file_path),
+            redundancy: 0,
         };
         let index = file_handle.build_index()?;
         Ok(KvStore {
@@ -79,20 +82,21 @@ impl KvsEngine for KvStore {
         };
 
         let file_handle_locker = Arc::clone(&self.file_handle_keeper);
-        let file_handle = file_handle_locker.lock().unwrap();
+        let mut file_handle = file_handle_locker.lock().unwrap();
         let index_locker = Arc::clone(&self.index_keeper);
-        let mut index = index_locker.lock().unwrap();
+        let index = index_locker.lock().unwrap();
 
-        let offset = file_handle.write_log(record, &index)?;
+        let offset = file_handle.write_log(record, index)?;
+        let mut index = index_locker.lock().unwrap();
         index.insert(key, offset);
         Ok(())
     }
 
     fn remove(&self, key: String) -> Result<()> {
         let file_handle_locker = Arc::clone(&self.file_handle_keeper);
-        let file_handle = file_handle_locker.lock().unwrap();
+        let mut file_handle = file_handle_locker.lock().unwrap();
         let index_locker = Arc::clone(&self.index_keeper);
-        let mut index = index_locker.lock().unwrap();
+        let index = index_locker.lock().unwrap();
 
         index.get(&key).ok_or(KvsError::KeyNotFound)?;
         let record = Command {
@@ -100,7 +104,8 @@ impl KvsEngine for KvStore {
             key: key.clone(),
             value: None,
         };
-        file_handle.write_log(record, &index)?;
+        file_handle.write_log(record, index)?;
+        let mut index = index_locker.lock().unwrap();
         index.remove(&key);
         Ok(())
     }
@@ -109,6 +114,7 @@ impl KvsEngine for KvStore {
 #[derive(Clone)]
 struct DBFileHandle {
     file_path: Box<Path>,
+    redundancy: u64,
 }
 
 impl DBFileHandle {
@@ -149,16 +155,27 @@ impl DBFileHandle {
         Ok(record?.value)
     }
 
-    pub fn write_log(&self, record: Command, index: &HashMap<String, usize>) -> Result<usize> {
-        /* try to use enviroment variable instead? */
-        let log_size_limit = 10_0000;
-
-        let mut size = metadata(&self.file_path)?.len();
-        if size > log_size_limit {
-            self.compact_log(index)?;
-            size = metadata(&self.file_path)?.len();
+    pub fn write_log(
+        &mut self,
+        record: Command,
+        mut index: MutexGuard<HashMap<String, usize>>,
+    ) -> Result<usize> {
+        /* maintain self.redundancy */
+        if record.op == OpType::Remove
+            || (record.op == OpType::Set && index.get(&record.key) != None)
+        {
+            let redundant_record = self.get_value_by_offset(index.get(&record.key).unwrap())?;
+            self.redundancy += serde_json::to_string(&redundant_record)?.len() as u64;
         }
-
+        if self.redundancy > MAX_REDUNDANCY {
+            self.compact_log(&index)?;
+            /* update index (can refine) */
+            index.clear();
+            for (key, value) in self.build_index()? {
+                index.insert(key, value);
+            }
+        }
+        let size = metadata(&self.file_path)?.len();
         let mut file = OpenOptions::new().append(true).open(&self.file_path)?;
         serde_json::to_writer(&mut file, &record)?;
 
@@ -169,7 +186,7 @@ impl DBFileHandle {
         strategy: copy log entry that still alive into a new file
         then use it to overwrite the old log file.
     */
-    pub fn compact_log(&self, index: &HashMap<String, usize>) -> Result<()> {
+    pub fn compact_log(&mut self, index: &HashMap<String, usize>) -> Result<()> {
         let something = &format!("{}_compacted", self.file_path.to_str().unwrap());
         let new_log_path = Path::new(something);
         File::create(&new_log_path)?;
@@ -186,6 +203,7 @@ impl DBFileHandle {
         }
 
         rename(&new_log_path, &self.file_path)?;
+        self.redundancy = 0;
         Ok(())
     }
 }

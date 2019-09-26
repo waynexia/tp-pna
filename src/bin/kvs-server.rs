@@ -1,7 +1,7 @@
 extern crate clap;
 use clap::App;
 use kvs::thread_pool::{SharedQueueThreadPool, ThreadPool};
-use kvs::{KvStore, KvsError, Protocol, Result, SledKvsEngine,KvsEngine,Command, OpType};
+use kvs::{Command, KvStore, KvsEngine, KvsError, OpType, Protocol, Result, SledKvsEngine};
 use num_cpus;
 use std::error::Error;
 use std::fs::File;
@@ -14,7 +14,7 @@ extern crate slog_async;
 extern crate slog_term;
 use slog::Drain;
 
-const DEFAULT_ADDR : &str = "127.0.0.1:4000";
+const DEFAULT_ADDR: &str = "127.0.0.1:4000";
 
 fn main() -> Result<()> {
     /* load clap config from yaml file */
