@@ -38,7 +38,6 @@ const MAX_REDUNDANCY: u64 = 1 << 16;
 #[derive(Clone)]
 pub struct KvStore {
     index_keeper: Arc<Mutex<HashMap<String, usize>>>,
-    // db_file_path: Box<Path>,
     file_handle_keeper: Arc<Mutex<DBFileHandle>>,
 }
 
@@ -69,7 +68,7 @@ impl KvsEngine for KvStore {
         let index = index_locker.lock().unwrap();
 
         file_handle.get_value_by_offset(match index.get(&key) {
-            Some(item) => item,
+            Some(item) => *item,
             None => return Ok(None),
         })
     }
@@ -111,6 +110,8 @@ impl KvsEngine for KvStore {
     }
 }
 
+/// This struct should be protected by Mutex to ensure DBFile will not be access
+/// by more than one thread ssimultaneously.
 #[derive(Clone)]
 struct DBFileHandle {
     file_path: Box<Path>,
@@ -145,9 +146,9 @@ impl DBFileHandle {
         Ok(index)
     }
 
-    pub fn get_value_by_offset(&self, offset: &usize) -> Result<Option<String>> {
+    pub fn get_value_by_offset(&self, offset: usize) -> Result<Option<String>> {
         let mut file = File::open(&self.file_path)?;
-        file.seek(SeekFrom::Start(*offset as u64))?;
+        file.seek(SeekFrom::Start(offset as u64))?;
         let record = serde_json::Deserializer::from_reader(BufReader::new(file))
             .into_iter::<Command>()
             .next()
@@ -164,7 +165,7 @@ impl DBFileHandle {
         if record.op == OpType::Remove
             || (record.op == OpType::Set && index.get(&record.key) != None)
         {
-            let redundant_record = self.get_value_by_offset(index.get(&record.key).unwrap())?;
+            let redundant_record = self.get_value_by_offset(*index.get(&record.key).unwrap())?;
             self.redundancy += serde_json::to_string(&redundant_record)?.len() as u64;
         }
         if self.redundancy > MAX_REDUNDANCY {
@@ -182,10 +183,7 @@ impl DBFileHandle {
         Ok(size as usize)
     }
 
-    /*
-        strategy: copy log entry that still alive into a new file
-        then use it to overwrite the old log file.
-    */
+    /* strategy: dump index to overwrite existing database file */
     pub fn compact_log(&mut self, index: &HashMap<String, usize>) -> Result<()> {
         let something = &format!("{}_compacted", self.file_path.to_str().unwrap());
         let new_log_path = Path::new(something);

@@ -48,10 +48,8 @@ impl SledKvsEngine {
 impl KvsEngine for SledKvsEngine {
     fn get(&self, key: String) -> Result<Option<String>> {
         match self.db.get(key.as_bytes())? {
-            Some(value) => {
-                return Ok(Some(String::from_utf8(value.to_vec()).unwrap()));
-            }
-            None => return Ok(None),
+            Some(value) => Ok(Some(String::from_utf8(value.to_vec()).unwrap())),
+            None => Ok(None),
         }
     }
     fn set(&self, key: String, value: String) -> Result<()> {

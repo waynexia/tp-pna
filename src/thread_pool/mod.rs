@@ -10,7 +10,7 @@ pub use naive::NaiveThreadPool;
 pub use shared_queue::SharedQueueThreadPool;
 
 /// Trait `ThreadPool` is for multithread jobs. Required functions
-/// are `new` and `spawn`. 
+/// are `new` and `spawn`.
 pub trait ThreadPool {
     /// Construct a new thread pool with total threads number `threads`.
     fn new(threads: u32) -> Result<Self>

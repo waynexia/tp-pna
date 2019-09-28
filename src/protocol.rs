@@ -90,9 +90,9 @@ impl<'a> Protocol<'a> {
     /// If input `result` is a empty slice
     pub fn parse_result(result: &str) -> Result<(Status, String)> {
         match result.chars().nth(0) {
-            Some('+') => return Ok((Status::Ok, result.get(1..).unwrap().to_string())),
-            Some('-') => return Ok((Status::Error, result.get(1..).unwrap().to_string())),
-            Some('*') => return Ok((Status::Message, result.get(1..).unwrap().to_string())),
+            Some('+') => Ok((Status::Ok, result.get(1..).unwrap().to_string())),
+            Some('-') => Ok((Status::Error, result.get(1..).unwrap().to_string())),
+            Some('*') => Ok((Status::Message, result.get(1..).unwrap().to_string())),
             _ => unreachable!(),
         }
     }
