@@ -2,7 +2,7 @@ use super::ThreadPool;
 use crate::error::Result;
 use rayon;
 
-///
+/// A wrapper of crate `rayon`. Implement trait `ThreadPool`
 pub struct RayonThreadPool {
     thread_pool: rayon::ThreadPool,
 }

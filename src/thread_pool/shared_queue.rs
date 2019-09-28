@@ -5,7 +5,12 @@ use std::process::exit;
 use std::sync::mpsc::{channel, Sender};
 use std::thread;
 
-///
+/// A struct that implemented trait `ThreadPool`.
+/// 
+/// As its name shows, shared queue is used for scheduling work. 
+/// If one child thread paniced when executing, a monitor thread
+/// will receive a message about this and spawn a new thread to 
+/// keep the total threads in the thread pool stay the same.
 pub struct SharedQueueThreadPool {
     tx_worker: Sender<ThreadPoolMessage>,
     threads: u32,
@@ -70,7 +75,6 @@ impl ThreadPool for SharedQueueThreadPool {
         Ok(SharedQueueThreadPool { tx_worker, threads })
     }
 
-    /// Send job via a mpsc channel to monitor thread
     fn spawn<F>(&self, job: F)
     where
         F: FnOnce() + Send + 'static,

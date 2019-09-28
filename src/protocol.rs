@@ -33,7 +33,7 @@ pub struct Command {
 pub enum Status {
     /// Command executes successfully
     Ok,
-    /// A error is reported
+    /// An error is reported
     Error,
     /// No error found, system sends some message
     Message,
@@ -53,7 +53,11 @@ impl<'a> Protocol<'a> {
         Protocol { stream }
     }
 
-    /// Send a serializable content.
+    /// Send a serializable content. Return `self` if success.
+    /// # Error:
+    /// Propagate `TcpStream` error
+    /// # Panic:
+    /// If cannot serialize `content`
     pub fn send<T: Serialize>(&mut self, content: &T) -> Result<&'a mut Protocol> {
         let serialized = bincode::serialize(content).unwrap();
         let len = bincode::serialize(&serialized.len()).unwrap();
@@ -64,6 +68,10 @@ impl<'a> Protocol<'a> {
 
     /// To receive a object in given type.
     /// This function will block until read enough data.
+    /// # Error:
+    /// Propagate `TcpStream` error
+    /// # Panic:
+    /// If cannot serialize `content`
     pub fn receive<T>(&mut self) -> Result<T>
     where
         for<'de> T: Deserialize<'de>,
@@ -78,6 +86,8 @@ impl<'a> Protocol<'a> {
     }
 
     /// Parse the returned message from server for client.
+    /// # Panic
+    /// If input `result` is a empty slice
     pub fn parse_result(result: &str) -> Result<(Status, String)> {
         match result.chars().nth(0) {
             Some('+') => return Ok((Status::Ok, result.get(1..).unwrap().to_string())),
