@@ -143,7 +143,7 @@ impl Config {
     pub fn check_one_leader(&self) -> usize {
         let mut random = rand::thread_rng();
         let mut leaders = HashMap::new();
-        for _iters in 0..10 {
+        for _ in 0..10 {
             let ms = 450 + (random.gen::<u64>() % 100);
             thread::sleep(Duration::from_millis(ms));
 
