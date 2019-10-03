@@ -67,6 +67,7 @@ impl Default for State {
 }
 
 // states in Fig.4
+#[derive(Debug)]
 enum ServerStates {
     Follower,
     Candidate,
@@ -78,6 +79,7 @@ enum ServerStates {
 pub enum IncomingRpcType {
     AppendEntries,
     RequestVote,
+    TurnToFollower,
 }
 
 // A single Raft peer.
@@ -200,7 +202,7 @@ impl Raft {
             peer.request_vote(&args)
                 .map_err(Error::Rpc)
                 .then(move |res| {
-                    tx.send(res).unwrap();
+                    tx.send(res).unwrap_or_default(); // supress Unused Result
                     Ok(())
                 }),
         );
@@ -224,7 +226,7 @@ impl Raft {
             peer.append_entries(&args)
                 .map_err(Error::Rpc)
                 .then(move |res| {
-                    tx.send(res).unwrap();
+                    tx.send(res).unwrap_or_default(); // supress Unused Result
                     Ok(())
                 }),
         );
@@ -269,8 +271,13 @@ impl Raft {
             match server_state {
                 ServerStates::Follower => {
                     if clock > election_timeout {
+                        // begin to send request vote RPC
+                        let mut state = self.state.lock().unwrap();
+                        state.current_term += 1;
+                        drop(state);
                         let request_vote_args = RequestVoteArgs {
-                            term: self.state.lock().unwrap().term(),
+                            // term: self.state.lock().unwrap().term(),
+                            term: self.get_term(),
                             candidate_id: self.me as u64,
                             last_log_index: 0, //?
                             last_log_term: 0,  //?
@@ -287,9 +294,9 @@ impl Raft {
 
                         let (tx, rx) = channel();
                         let majority = self.majority;
+                        // spawn a new thread to listen response from others and counts votes
                         thread::spawn(move || {
-                            // spawn a new thread to listen response from others and counts votes
-                            let mut cnt = 0;
+                            let mut cnt = 1; // 1 for self
                             while cnt < majority && !teller.is_empty() {
                                 teller.retain(|rcv| {
                                     if let Ok(response) = rcv.try_recv() {
@@ -303,7 +310,7 @@ impl Raft {
                                     true
                                 });
                             }
-                            tx.send(cnt >= majority).unwrap();
+                            if tx.send(cnt >= majority).is_err() {}
                         });
 
                         clock = 0;
@@ -315,8 +322,13 @@ impl Raft {
 
                 ServerStates::Candidate => {
                     if clock > election_timeout {
+                        // begin to send request vote RPC
+                        let mut state = self.state.lock().unwrap();
+                        state.current_term += 1;
+                        drop(state);
                         let request_vote_args = RequestVoteArgs {
-                            term: self.state.lock().unwrap().term(),
+                            // term: self.state.lock().unwrap().term(),
+                            term: self.get_term(),
                             candidate_id: self.me as u64,
                             last_log_index: 0, //?
                             last_log_term: 0,  //?
@@ -335,7 +347,7 @@ impl Raft {
                         let majority = self.majority;
                         thread::spawn(move || {
                             // spawn a new thread to listen response from others and counts votes
-                            let mut cnt = 0;
+                            let mut cnt = 1; // 1 for self
                             while cnt < majority && !teller.is_empty() {
                                 teller.retain(|rcv| {
                                     if let Ok(response) = rcv.try_recv() {
@@ -349,7 +361,7 @@ impl Raft {
                                     true
                                 });
                             }
-                            tx.send(cnt >= majority).unwrap();
+                            if tx.send(cnt >= majority).is_err() {}
                         });
 
                         clock = 0;
@@ -362,6 +374,7 @@ impl Raft {
                                 server_state = ServerStates::Leader;
                                 let mut state = self.state.lock().unwrap();
                                 state.is_leader = true;
+                                state.voted_for = None;
                                 clock = 0;
                             }
                             wating_vote_result = false;
@@ -374,7 +387,7 @@ impl Raft {
                         let mut follower_tx = vec![];
                         // construct append_entries_args
                         let append_entries_args = AppendEntriesArgs {
-                            term: self.state.lock().unwrap().term(),
+                            term: self.get_term(),
                             leader_id: self.me as u64,
                             prev_log_index: 0, //?
                             prev_log_term: 0,  //?
@@ -408,7 +421,7 @@ impl Raft {
                                     true
                                 })
                             }
-                            tx.send(cnt >= majority).unwrap();
+                            if tx.send(cnt >= majority).is_err() {}
                         });
 
                         clock = 0;
@@ -418,7 +431,7 @@ impl Raft {
                     if wating_append_result {
                         if let Ok(result) = append_entries_rx.try_recv() {
                             if result {
-                                server_state = ServerStates::Leader;
+                                // server_state = ServerStates::Leader;
                                 clock = 0;
                             }
                             wating_append_result = false;
@@ -431,10 +444,24 @@ impl Raft {
 
             // try to receive heartbeat
             if !self.is_leader() {
-                let signal = self.rx.try_recv();
-                if signal.is_ok() && signal.unwrap() == IncomingRpcType::RequestVote {
+                if let Ok(signal) = self.rx.try_recv() {
+                    if signal == IncomingRpcType::RequestVote {
+                        // need to judge term
+                        let mut state = self.state.lock().unwrap();
+                        server_state = ServerStates::Follower;
+                        state.voted_for = None;
+                    }
                     clock = 0;
                 }
+            } else if let Ok(signal) = self.rx.try_recv() {
+                if signal == IncomingRpcType::TurnToFollower {
+                    // need to judge term
+                    let mut state = self.state.lock().unwrap();
+                    server_state = ServerStates::Follower;
+                    state.voted_for = None;
+                    state.is_leader = false;
+                }
+                clock = 0;
             }
 
             clock += 1;
@@ -472,10 +499,19 @@ impl Raft {
     }
 
     /// try to append a entries. return the current_term in success, 0 in error.
-    pub fn append_entries(&self, _args: AppendEntriesArgs) -> u64 {
+    pub fn append_entries(&self, args: AppendEntriesArgs) -> u64 {
         // reset election timeout
         // self.state.lock().unwrap().term() + args.entries.len() as u64
-        1
+        let mut state = self.state.lock().unwrap();
+        if args.term >= state.current_term {
+            self.tx
+                .send(IncomingRpcType::TurnToFollower)
+                .unwrap_or_default();
+            state.current_term = args.term;
+            1
+        } else {
+            0
+        }
     }
 }
 
