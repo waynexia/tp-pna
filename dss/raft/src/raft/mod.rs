@@ -260,6 +260,10 @@ impl Raft {
         let mut server_state = ServerStates::Follower;
         let (_, rx) = channel();
         let mut teller_rx: Receiver<bool> = rx;
+        let (_, rx) = channel();
+        let mut append_entries_rx: Receiver<bool> = rx;
+        let mut wating_vote_result = false;
+        let mut wating_append_result = false;
 
         loop {
             match server_state {
@@ -305,6 +309,7 @@ impl Raft {
                         clock = 0;
                         server_state = ServerStates::Candidate;
                         teller_rx = rx;
+                        wating_vote_result = true;
                     }
                 }
 
@@ -349,17 +354,24 @@ impl Raft {
 
                         clock = 0;
                         teller_rx = rx;
+                        wating_vote_result = true;
                     }
-                    if let Ok(result) = teller_rx.try_recv() {
-                        if result {
-                            server_state = ServerStates::Leader;
-                            clock = 0;
+                    if wating_vote_result {
+                        if let Ok(result) = teller_rx.try_recv() {
+                            if result {
+                                server_state = ServerStates::Leader;
+                                let mut state = self.state.lock().unwrap();
+                                state.is_leader = true;
+                                clock = 0;
+                            }
+                            wating_vote_result = false;
                         }
                     }
                 }
 
                 ServerStates::Leader => {
                     if clock > HEARTBEAT_INTERVAL {
+                        let mut follower_tx = vec![];
                         // construct append_entries_args
                         let append_entries_args = AppendEntriesArgs {
                             term: self.state.lock().unwrap().term(),
@@ -374,9 +386,43 @@ impl Raft {
                                 continue;
                             }
                             // how to use receiver returned by this?
-                            self.send_append_entries(server_index, &append_entries_args);
+                            follower_tx
+                                .push(self.send_append_entries(server_index, &append_entries_args));
                         }
+
+                        let (tx, rx) = channel();
+                        let majority = self.majority;
+                        thread::spawn(move || {
+                            // spawn a new thread to listen response from follower's response
+                            let mut cnt = 0;
+                            while cnt < majority && !follower_tx.is_empty() {
+                                follower_tx.retain(|rcv| {
+                                    if let Ok(response) = rcv.try_recv() {
+                                        if let Ok(append_entries_reply) = response {
+                                            if append_entries_reply.success {
+                                                cnt += 1;
+                                            }
+                                        }
+                                        return false;
+                                    }
+                                    true
+                                })
+                            }
+                            tx.send(cnt >= majority).unwrap();
+                        });
+
                         clock = 0;
+                        append_entries_rx = rx;
+                        wating_append_result = true;
+                    }
+                    if wating_append_result {
+                        if let Ok(result) = append_entries_rx.try_recv() {
+                            if result {
+                                server_state = ServerStates::Leader;
+                                clock = 0;
+                            }
+                            wating_append_result = false;
+                        }
                     }
                 }
             }
@@ -409,16 +455,16 @@ impl Raft {
 
     /// try to vote for a candidate. If success, set state and return true, else return false
     pub fn vote_for(&self, term: u64, candidate_id: u64, last_log_index: u64) -> bool {
-        // let state = self.state;
-        if self.state.lock().unwrap().current_term <= term
-            && (self.state.lock().unwrap().voted_for.is_none()
-                || self.state.lock().unwrap().voted_for == Some(candidate_id))
-            && self.state.lock().unwrap().last_applied <= last_log_index
+        let s = self.state.clone();
+        let mut state = s.lock().unwrap();
+        if state.current_term <= term
+            && (state.voted_for.is_none() || state.voted_for == Some(candidate_id))
+            && state.last_applied <= last_log_index
         {
             // Arc::get_mut(&mut self.state).unwrap().voted_for = Some(candidate_id);
             // state.voted_for.set(Some(candidate_id));
             // state.get_mut().vote_for = Some(candidate_id);
-            self.state.lock().unwrap().voted_for = Some(candidate_id);
+            state.voted_for = Some(candidate_id);
 
             return true;
         }
@@ -426,9 +472,10 @@ impl Raft {
     }
 
     /// try to append a entries. return the current_term in success, 0 in error.
-    pub fn append_entries(&mut self, args: AppendEntriesArgs) -> u64 {
+    pub fn append_entries(&self, _args: AppendEntriesArgs) -> u64 {
         // reset election timeout
-        self.state.lock().unwrap().term() + args.entries.len() as u64
+        // self.state.lock().unwrap().term() + args.entries.len() as u64
+        1
     }
 }
 
@@ -463,7 +510,7 @@ impl Raft {
 #[derive(Clone)]
 pub struct Node {
     // Your code here.
-    raft: Arc<Mutex<Raft>>,
+    raft: Arc<Raft>,
     // raft: Raft,
 }
 
@@ -476,11 +523,11 @@ impl Node {
         // });
         // Your code here.
         // crate::your_code_here(raft)
-        let raft = Arc::new(Mutex::new(raft));
+        let raft = Arc::new(raft);
 
         let r = raft.clone();
         thread::spawn(move || {
-            let raft = r.lock().unwrap();
+            let raft = r;
             raft.start_state_machine();
         });
 
@@ -521,7 +568,8 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.term
-        crate::your_code_here(())
+        // crate::your_code_here(())
+        self.raft.get_term()
     }
 
     /// Whether this peer believes it is the leader.
@@ -529,7 +577,8 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.leader_id == self.id
-        crate::your_code_here(())
+        // crate::your_code_here(())
+        self.raft.is_leader()
     }
 
     /// The current state of this peer.
@@ -543,7 +592,7 @@ impl Node {
 
         // let raft_locked = self.raft.clone();
         // let raft = raft_locked.lock().unwrap();
-        let raft = self.raft.lock().unwrap();
+        let raft = self.raft.clone();
         raft.get_state()
     }
 
@@ -570,7 +619,7 @@ impl RaftService for Node {
 
         // let r = self.raft.clone();
         // let mut raft = r.lock().unwrap();
-        let raft = self.raft.lock().unwrap();
+        let raft = self.raft.clone();
         let term = raft.get_term();
 
         if raft.vote_for(args.term, args.candidate_id, args.last_log_index) {
@@ -590,7 +639,7 @@ impl RaftService for Node {
     fn append_entries(&self, args: AppendEntriesArgs) -> RpcFuture<AppendEntriesReply> {
         // let r = self.raft.clone();
         // let mut raft = self.raft.lock().unwrap();
-        let mut raft = self.raft.lock().unwrap();
+        let raft = self.raft.clone();
 
         let term = raft.append_entries(args);
         if term > 0 {
