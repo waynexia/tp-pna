@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crossbeam::channel::{bounded, Receiver as CReceiver, Sender as CSender};
+use crossbeam::channel::{bounded, unbounded, Receiver as CReceiver, Sender as CSender};
 use futures::sync::mpsc::UnboundedSender;
 use futures::Future;
 use labrpc::RpcFuture;
@@ -40,7 +40,8 @@ pub struct State {
     pub is_leader: bool,
     pub leader_id: u64,
 
-    pub last_applied: u64,
+    pub last_applied: u64, // committed
+    pub commit_index: u64, // to be committed
 }
 
 impl State {
@@ -62,6 +63,7 @@ impl Default for State {
             is_leader: false,
             leader_id: 0,
             last_applied: 0,
+            commit_index: 0,
         }
     }
 }
@@ -96,7 +98,10 @@ pub struct Raft {
     // state a Raft server must maintain.
     pub tx: CSender<IncomingRpcType>,
     rx: CReceiver<IncomingRpcType>,
+    append_tx: CSender<Vec<u8>>,
+    append_rx: CReceiver<Vec<u8>>,
     majority: usize, // number of majority
+    apply_ch: UnboundedSender<ApplyMsg>,
 }
 
 impl Raft {
@@ -112,12 +117,13 @@ impl Raft {
         peers: Vec<RaftClient>,
         me: usize,
         persister: Box<dyn Persister>,
-        _apply_ch: UnboundedSender<ApplyMsg>,
+        apply_ch: UnboundedSender<ApplyMsg>,
     ) -> Raft {
         let raft_state = persister.raft_state();
 
         // Your initialization code here (2A, 2B, 2C).
         let (tx, rx) = bounded(1);
+        let (append_tx, append_rx) = unbounded();
         let majority = (peers.len() + 1) / 2;
         let mut raft = Raft {
             peers,
@@ -126,7 +132,10 @@ impl Raft {
             state: Arc::default(),
             tx,
             rx,
+            append_tx,
+            append_rx,
             majority,
+            apply_ch,
         };
 
         // initialize from state persisted before a crash
@@ -238,18 +247,32 @@ impl Raft {
     where
         M: labcodec::Message,
     {
-        let index = 0;
-        let term = 0;
-        let is_leader = true;
-        let mut buf = vec![];
-        labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
         // Your code here (2B).
 
-        if is_leader {
-            Ok((index, term))
-        } else {
-            Err(Error::NotLeader)
+        if !self.is_leader() {
+            return Err(Error::NotLeader);
         }
+
+        // construct return value pair
+        let mut state = self.state.lock().unwrap();
+        let index = state.commit_index + 1;
+        let term = state.term();
+        state.commit_index += 1;
+        drop(state);
+
+        // send this command to state machine.
+        let mut buf = vec![];
+        labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
+        self.append_tx.send(buf).unwrap();
+        // self.apply_ch
+        //     .unbounded_send(ApplyMsg {
+        //         command_valid: true,
+        //         command: buf,
+        //         command_index: index,
+        //     })
+        //     .unwrap();
+
+        Ok((index, term))
     }
 
     pub fn start_state_machine(&self) {
@@ -266,6 +289,7 @@ impl Raft {
         let mut append_entries_rx: Receiver<bool> = rx;
         let mut wating_vote_result = false;
         let mut wating_append_result = false;
+        let mut entries = vec![];
 
         loop {
             match server_state {
@@ -385,20 +409,25 @@ impl Raft {
                 ServerStates::Leader => {
                     if clock > HEARTBEAT_INTERVAL {
                         let mut follower_tx = vec![];
+
+                        // gather entries need to ack
+                        while !self.append_rx.is_empty() {
+                            entries.push(self.append_rx.recv().unwrap());
+                        }
+
                         // construct append_entries_args
                         let append_entries_args = AppendEntriesArgs {
                             term: self.get_term(),
                             leader_id: self.me as u64,
                             prev_log_index: 0, //?
                             prev_log_term: 0,  //?
-                            entries: vec![],
+                            entries: entries.clone(),
                             leader_commit: 0, //
                         };
                         for server_index in 0..self.peers.len() {
                             if server_index == self.me {
                                 continue;
                             }
-                            // how to use receiver returned by this?
                             follower_tx
                                 .push(self.send_append_entries(server_index, &append_entries_args));
                         }
@@ -431,7 +460,19 @@ impl Raft {
                     if wating_append_result {
                         if let Ok(result) = append_entries_rx.try_recv() {
                             if result {
-                                // server_state = ServerStates::Leader;
+                                let mut state = self.state.lock().unwrap();
+                                // commit command(s) into apply_ch here
+                                for entry in entries.clone() {
+                                    self.apply_ch
+                                        .unbounded_send(ApplyMsg {
+                                            command_valid: true,
+                                            command: entry,
+                                            command_index: state.last_applied + 1,
+                                        })
+                                        .unwrap();
+                                    state.last_applied += 1;
+                                }
+                                entries.clear();
                                 clock = 0;
                             }
                             wating_append_result = false;
@@ -500,15 +541,30 @@ impl Raft {
 
     /// try to append a entries. return the current_term in success, 0 in error.
     pub fn append_entries(&self, args: AppendEntriesArgs) -> u64 {
-        // reset election timeout
-        // self.state.lock().unwrap().term() + args.entries.len() as u64
+        // if not leader, send to apply_ch to commit,
+        // if is really leader, will not run into this function
+        // leader should call apply_ch in state machine
+
         let mut state = self.state.lock().unwrap();
+
         if args.term >= state.current_term {
             self.tx
                 .send(IncomingRpcType::TurnToFollower)
                 .unwrap_or_default();
             state.current_term = args.term;
-            1
+
+            for entry in args.entries {
+                self.apply_ch
+                    .unbounded_send(ApplyMsg {
+                        command_valid: true,
+                        command: entry,
+                        command_index: state.last_applied + 1,
+                    })
+                    .unwrap();
+                state.last_applied += 1;
+            }
+
+            state.current_term
         } else {
             0
         }
@@ -588,15 +644,18 @@ impl Node {
     {
         // Your code here.
         // Example:
-        // self.raft.start(command)
-        // crate::your_code_here(command)
 
-        if !self.is_leader() {
-            return Err(Error::NotLeader);
-        }
+        // need to return immediately, so just calculate return value under
+        // condition that "if success", and let raft state machine to really
+        // commit these commands gracefully
+        self.raft.start(command)
+
+        // if !self.is_leader() {
+        //     return Err(Error::NotLeader);
+        // }
         /* do something */
         // Ok(?,self.term())
-        crate::your_code_here(command)
+        // crate::your_code_here(command)
     }
 
     /// The current term of this peer.
@@ -673,8 +732,6 @@ impl RaftService for Node {
     }
 
     fn append_entries(&self, args: AppendEntriesArgs) -> RpcFuture<AppendEntriesReply> {
-        // let r = self.raft.clone();
-        // let mut raft = self.raft.lock().unwrap();
         let raft = self.raft.clone();
 
         let term = raft.append_entries(args);
