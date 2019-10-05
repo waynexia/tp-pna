@@ -24,7 +24,7 @@ use crate::proto::raftpb::*;
 const MIN_TIMEOUT: u16 = 200;
 const MAX_TIMEOUT: u16 = 350;
 const HEARTBEAT_INTERVAL: u16 = 150;
-const RE_APPEND_INTERVAL: u16 = 100;
+const APPEND_LISTEN_PERIOD: u16 = 100;
 const ACTION_INTERVAL: u32 = 1_000_000; // in nano
 
 pub struct ApplyMsg {
@@ -170,6 +170,10 @@ impl Raft {
         self.state.lock().unwrap().term()
     }
 
+    pub fn get_log(&self) -> Vec<Vec<u8>> {
+        self.state.lock().unwrap().log.clone()
+    }
+
     /// save Raft's persistent state to stable storage,
     /// where it can later be retrieved after a crash and restart.
     /// see paper's Figure 2 for a description of what should be persistent.
@@ -307,6 +311,7 @@ impl Raft {
         let mut teller_rx: Receiver<bool> = rx;
         let (_, rx) = channel();
         let mut append_entries_rx: Receiver<bool> = rx;
+        let (append_entries_reply_tx, append_entries_reply_rx) = channel();
         let mut wating_vote_result = false;
         let mut wating_append_result = false;
         let mut entries = vec![];
@@ -333,8 +338,6 @@ impl Raft {
                             }
                             teller.push(self.send_request_vote(server_index, &request_vote_args));
                         }
-                        // need a vote timeout?
-                        // do vote count
 
                         let (tx, rx) = channel();
                         let majority = self.majority;
@@ -431,142 +434,115 @@ impl Raft {
                         // for ack from followers
                         let (tx, rx) = channel();
 
-                        // gather entries need to ack
+                        // gather entries need to replicate
                         while !self.append_rx.is_empty() {
                             entries.push(self.append_rx.recv().unwrap());
                         }
 
                         // spawn a new thread to indefinitely send AppendEntries RPC
-                        let entries_to_send = entries.clone();
+                        let log = self.get_log();
+                        // let entries_to_send = entries.clone();
                         let term = self.get_term();
                         let leader_id = self.me;
                         let num_peers = self.peers.len();
                         let peers = self.peers.clone();
                         let majority = self.majority;
-                        let state = self.state.lock().unwrap();
+                        let mut state = self.state.lock().unwrap();
                         let prev_log_index = state.last_applied;
-                        drop(state);
-                        thread::spawn(move || {
-                            let mut reply_to_leader = true;
-                            let mut un_ack = vec![];
-                            for index in 0..num_peers {
-                                if index == leader_id {
-                                    continue;
+                        // adjust last_applied based on reply from last AppendEntriesRpc
+                        if let Ok(adjust) = append_entries_reply_rx.try_recv() {
+                            for (index, accept) in adjust {
+                                if accept {
+                                    state.next_index[index] = state.last_applied;
+                                } else {
+                                    state.next_index[index] -= 1;
                                 }
-                                un_ack.push(index);
                             }
-                            while !un_ack.is_empty() {
-                                let tx = tx.clone();
-                                let (acked_tx, acked_rx) = channel();
+                        }
+                        let next_index = state.next_index.clone();
+                        drop(state);
+                        let mut follower_tx = vec![];
 
-                                let mut follower_tx = vec![];
-                                // construct append_entries_args
-                                let append_entries_args = AppendEntriesArgs {
-                                    term,
-                                    leader_id: leader_id as u64,
-                                    prev_log_index,      //?
-                                    prev_log_term: term, //?
-                                    entries: entries_to_send.clone(),
-                                    leader_commit: 0, //
-                                };
+                        // need not to spawn a new thread
+                        for index in 0..num_peers {
+                            if index == leader_id {
+                                continue;
+                            }
 
-                                println!(
-                                    "send {:?} with index {} to {:?}",
-                                    entries_to_send, prev_log_index, un_ack
-                                );
+                            // construct entry list by `next_index` for every single peer
+                            // will extries stay?
+                            let entries_to_send = [
+                                if log.len() > 0 {
+                                    log[next_index[index] as usize..].to_vec()
+                                } else {
+                                    vec![]
+                                },
+                                entries.clone(),
+                            ]
+                            .concat();
+                            let append_entries_args = AppendEntriesArgs {
+                                term,
+                                leader_id: leader_id as u64,
+                                prev_log_index,      //?
+                                prev_log_term: term, //?
+                                entries: entries_to_send,
+                                leader_commit: 0, //
+                            };
 
-                                for server_index in un_ack.clone() {
-                                    follower_tx.push((
-                                        Raft::send_append_entries(
-                                            &peers,
-                                            server_index.to_owned(),
-                                            &append_entries_args,
-                                        ),
-                                        server_index,
-                                    ));
-                                }
+                            follower_tx.push((
+                                Raft::send_append_entries(
+                                    &peers,
+                                    index.to_owned(),
+                                    &append_entries_args,
+                                ),
+                                index,
+                            ));
+                        }
 
-                                // spawn a new thread to listen response from follower's response
-                                thread::spawn(move || {
-                                    let mut cnt = 1;
-                                    let mut clock = 0;
-                                    while (reply_to_leader && cnt < majority)
-                                        || !follower_tx.is_empty()
-                                    {
-                                        follower_tx.retain(|(rcv, index)| {
-                                            if let Ok(response) = rcv.try_recv() {
-                                                if let Ok(append_entries_reply) = response {
-                                                    if append_entries_reply.success {
-                                                        acked_tx
-                                                            .send(index.to_owned())
-                                                            .unwrap_or_default();
-                                                        cnt += 1;
-                                                    }
-                                                }
-                                                return false;
+                        // spawn a new thread to listen response from follower's response
+                        let append_entries_reply_tx = append_entries_reply_tx.clone();
+                        let tx = tx.clone();
+                        // if a follower's reply contains a term greater than leader, send
+                        // message to this channel to let this leader step down.
+                        let step_down_tx = self.tx.clone();
+                        let mut leader_term = self.state.lock().unwrap().current_term;
+                        thread::spawn(move || {
+                            let mut cnt = 1;
+                            let mut clock = 0;
+                            let mut reply = vec![];
+                            while !follower_tx.is_empty() {
+                                follower_tx.retain(|(rcv, index)| {
+                                    if let Ok(response) = rcv.try_recv() {
+                                        if let Ok(append_entries_reply) = response {
+                                            if append_entries_reply.term > leader_term {
+                                                leader_term = append_entries_reply.term;
+                                                step_down_tx
+                                                    .send(IncomingRpcType::TurnToFollower)
+                                                    .unwrap_or_default();
                                             }
-                                            true
-                                        });
-
-                                        // end for this time, will resend append entries rpc and start
-                                        // another receive time.
-                                        if clock > RE_APPEND_INTERVAL {
-                                            break;
+                                            if append_entries_reply.success {
+                                                cnt += 1;
+                                            }
+                                            reply.push((
+                                                index.to_owned(),
+                                                append_entries_reply.success,
+                                            ));
                                         }
-                                        clock += 1;
-                                        thread::sleep(action_interval);
+                                        return false;
                                     }
-                                    if reply_to_leader && tx.send(cnt >= majority).is_ok() {
-                                        reply_to_leader = false;
-                                    }
+                                    true
                                 });
 
-                                for _ in 0..RE_APPEND_INTERVAL {
-                                    while let Ok(acked_index) = acked_rx.try_recv() {
-                                        un_ack.retain(|index| index != &acked_index)
-                                    }
-                                    thread::sleep(action_interval);
+                                // end for this time
+                                if clock > APPEND_LISTEN_PERIOD {
+                                    break;
                                 }
+                                clock += 1;
+                                thread::sleep(action_interval);
                             }
+                            tx.send(cnt >= majority).unwrap_or_default();
+                            append_entries_reply_tx.send(reply).unwrap_or_default();
                         });
-
-                        // construct append_entries_args
-                        // let append_entries_args = AppendEntriesArgs {
-                        //     term: self.get_term(),
-                        //     leader_id: self.me as u64,
-                        //     prev_log_index: 0, //?
-                        //     prev_log_term: 0,  //?
-                        //     entries: entries.clone(),
-                        //     leader_commit: 0, //
-                        // };
-                        // for server_index in 0..self.peers.len() {
-                        //     if server_index == self.me {
-                        //         continue;
-                        //     }
-                        //     follower_tx
-                        //         .push(self.send_append_entries(server_index, &append_entries_args));
-                        // }
-
-                        // let (tx, rx) = channel();
-                        // let majority = self.majority;
-                        // thread::spawn(move || {
-                        //     // spawn a new thread to listen response from follower's response
-                        //     let mut cnt = 1;
-                        //     while cnt < majority && !follower_tx.is_empty() {
-                        //         follower_tx.retain(|rcv| {
-                        //             if let Ok(response) = rcv.try_recv() {
-                        //                 if let Ok(append_entries_reply) = response {
-                        //                     if append_entries_reply.success {
-                        //                         cnt += 1;
-                        //                     }
-                        //                 }
-                        //                 return false;
-                        //             }
-                        //             true
-                        //         })
-                        //     }
-                        //     if tx.send(cnt >= majority).is_err() {}
-                        // });
 
                         clock = 0;
                         append_entries_rx = rx;
@@ -576,6 +552,7 @@ impl Raft {
                         if let Ok(result) = append_entries_rx.try_recv() {
                             if result {
                                 let mut state = self.state.lock().unwrap();
+                                let mut log = state.log.clone();
                                 // commit command(s) into apply_ch here
                                 for entry in entries.clone() {
                                     self.apply_ch
@@ -585,10 +562,11 @@ impl Raft {
                                             command_index: state.last_applied + 1,
                                         })
                                         .unwrap();
-                                    // let mut applied_entries = self.entries.lock().unwrap();
-                                    // applied_entries.push(entry);
+                                    log.push(entry);
                                     state.last_applied += 1;
                                 }
+                                state.log = log;
+                                assert_eq!(state.log.len() as u64, state.last_applied + 1);
                                 entries.clear();
                                 clock = 0;
                                 wating_append_result = false;
@@ -597,8 +575,6 @@ impl Raft {
                     }
                 }
             }
-
-            // check clock for some timeout
 
             // try to receive heartbeat
             if !self.is_leader() {
@@ -663,6 +639,7 @@ impl Raft {
         // leader should call apply_ch in state machine
 
         let mut state = self.state.lock().unwrap();
+        let mut log = state.log.clone();
 
         if args.term >= state.current_term {
             self.tx
@@ -681,13 +658,15 @@ impl Raft {
                 self.apply_ch
                     .unbounded_send(ApplyMsg {
                         command_valid: true,
-                        command: entry,
+                        command: entry.clone(),
                         command_index: state.last_applied + 1,
                     })
                     .unwrap();
+                log.push(entry);
                 state.last_applied += 1;
             }
-
+            state.log = log;
+            assert_eq!(state.log.len() as u64, state.last_applied);
             state.current_term
         } else {
             0
