@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crossbeam::channel::{bounded, unbounded, Receiver as CReceiver, Sender as CSender};
+use crossbeam::channel::{bounded, Receiver as CReceiver, Sender as CSender};
 use futures::sync::mpsc::UnboundedSender;
 use futures::Future;
 use labrpc::RpcFuture;
@@ -149,8 +149,8 @@ pub struct Raft {
     // state a Raft server must maintain.
     pub tx: CSender<IncomingRpcType>,
     rx: CReceiver<IncomingRpcType>,
-    append_tx: CSender<Vec<u8>>,
-    append_rx: CReceiver<Vec<u8>>,
+    // append_tx: CSender<Vec<u8>>,
+    // append_rx: CReceiver<Vec<u8>>,
     majority: usize, // number of majority
     apply_ch: UnboundedSender<ApplyMsg>,
 }
@@ -174,7 +174,7 @@ impl Raft {
 
         // Your initialization code here (2A, 2B, 2C).
         let (tx, rx) = bounded(1);
-        let (append_tx, append_rx) = unbounded();
+        // let (append_tx, append_rx) = unbounded();
         let majority = (peers.len() + 1) / 2;
         let num_peers = peers.len();
         let mut raft = Raft {
@@ -184,8 +184,8 @@ impl Raft {
             state: State::new(num_peers),
             tx,
             rx,
-            append_tx,
-            append_rx,
+            // append_tx,
+            // append_rx,
             majority,
             apply_ch,
         };
@@ -310,16 +310,18 @@ impl Raft {
         }
 
         // construct return value pair
-        let index = self.state.commit_index.load(Ordering::Relaxed) + 1;
+        let index = self.state.last_applied.load(Ordering::Relaxed) + 1;
         let term = self.state.term();
-        // self.state.commit_index.store(index, Ordering::Relaxed);
+        self.state.last_applied.store(index, Ordering::Relaxed);
         // drop(state);
 
         // send this command to state machine.
         let mut buf = vec![];
         labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
+        let mut log = self.state.log.lock().unwrap();
         println!("buf : {:?}, command: {:?}", buf, command);
-        self.append_tx.send(buf).unwrap();
+        log.push(buf);
+        // self.append_tx.send(buf).unwrap();
         // self.apply_ch
         //     .unbounded_send(ApplyMsg {
         //         command_valid: true,
@@ -346,7 +348,7 @@ impl Raft {
         let (append_entries_reply_tx, append_entries_reply_rx) = channel();
         let mut wating_vote_result = false;
         let mut wating_append_result = false;
-        let mut entries = vec![];
+        // let mut entries = vec![];
 
         loop {
             match server_state {
@@ -468,10 +470,10 @@ impl Raft {
                         // for ack from followers
                         let (tx, rx) = channel();
 
-                        // gather entries need to replicate
-                        while !self.append_rx.is_empty() {
-                            entries.push(self.append_rx.recv().unwrap());
-                        }
+                        // collect entries need to replicate
+                        // while !self.append_rx.is_empty() {
+                        //     entries.push(self.append_rx.recv().unwrap());
+                        // }
 
                         // spawn a new thread to indefinitely send AppendEntries RPC
                         let term = self.get_term();
@@ -489,7 +491,7 @@ impl Raft {
                                 let mut next_index = self.state.next_index.lock().unwrap();
                                 if accept {
                                     next_index[index] =
-                                        self.state.last_applied.load(Ordering::Relaxed);
+                                        self.state.commit_index.load(Ordering::Relaxed);
                                 } else {
                                     next_index[index] = if next_index[index] > 0 {
                                         next_index[index] - 1
@@ -511,18 +513,22 @@ impl Raft {
                             }
 
                             // construct entry list by `next_index` for every single peer
-                            // will extries stay?
                             let log = self.get_log();
                             let prev_log_index = next_index[index];
-                            let entries_to_send = [
-                                if log.len() > 0 {
-                                    log[next_index[index] as usize..].to_vec()
-                                } else {
-                                    vec![]
-                                },
-                                entries.clone(),
-                            ]
-                            .concat();
+                            // let entries_to_send = [
+                            //     if log.len() > 0 {
+                            //         log[next_index[index] as usize..].to_vec()
+                            //     } else {
+                            //         vec![]
+                            //     },
+                            //     entries.clone(),
+                            // ]
+                            // .concat();
+                            let entries_to_send = if log.len() > 0 {
+                                log[next_index[index] as usize..].to_vec()
+                            } else {
+                                vec![]
+                            };
                             // println!("send {:?} to {}, constructed from log:{:?} and entry:{:?}",entries_to_send,index,log,entries);
                             let append_entries_args = AppendEntriesArgs {
                                 term,
@@ -602,33 +608,38 @@ impl Raft {
                         if let Ok(result) = append_entries_rx.try_recv() {
                             println!("received result: {}", result);
                             if result {
-                                let mut log = self.state.log.lock().unwrap();
+                                let log = self.get_log();
                                 // commit command(s) into apply_ch here
-                                for entry in entries.clone() {
-                                    let command_index =
-                                        self.state.last_applied.load(Ordering::Relaxed) + 1;
+                                // for entry in entries.clone() {
+                                for command_index in self.state.commit_index.load(Ordering::Relaxed)
+                                    ..self.state.last_applied.load(Ordering::Relaxed)
+                                {
+                                    // let command_index =
+                                    //     self.state.commit_index.load(Ordering::Relaxed) + 1;
+                                    let command = log[command_index as usize].clone();
                                     println!(
                                         "leader will commit {:?} with index {}",
-                                        entry, command_index
+                                        command,
+                                        command_index + 1
                                     );
                                     self.apply_ch
                                         .unbounded_send(ApplyMsg {
                                             command_valid: true,
-                                            command: entry.clone(),
-                                            command_index,
+                                            command,
+                                            command_index: command_index + 1,
                                         })
                                         .unwrap();
-                                    log.push(entry);
+                                    // log.push(entry);
                                     // state.last_applied += 1;
-                                    self.state.increase_last_applied();
+                                    // self.state.increase_last_applied();
                                     self.state.increase_commit_index();
                                 }
                                 // self.state.log = log;
-                                assert_eq!(
-                                    log.len() as u64,
-                                    self.state.last_applied.load(Ordering::Relaxed)
-                                );
-                                entries.clear();
+                                // assert_eq!(
+                                //     log.len() as u64,
+                                //     self.state.last_applied.load(Ordering::Relaxed)
+                                // );
+                                // entries.clear();
                                 clock = 0;
                                 wating_append_result = false;
                             }
@@ -682,7 +693,7 @@ impl Raft {
     pub fn vote_for(&self, term: u64, candidate_id: u64, last_log_index: u64) -> bool {
         let mut voted_for = self.state.voted_for.lock().unwrap();
         print!("self: {} (voted for:{:?}) received a vote request, candidate is {}, last log index is {}, own is {}",self.me,voted_for,candidate_id,last_log_index,self.state.last_applied.load(Ordering::Relaxed));
-        println!("  term is {}, own is {}", term, self.state.term());
+        print!("  term is {}, own is {}", term, self.state.term());
         // if (self.state.term() == term
         //     && (voted_for.is_none()
         //         || voted_for.as_ref().unwrap().load(Ordering::Relaxed) == candidate_id)
@@ -702,14 +713,17 @@ impl Raft {
             // state.get_mut().vote_for = Some(candidate_id);
             // state.voted_for = Some(candidate_id);
             *voted_for = Some(Arc::new(AtomicU64::from(candidate_id)));
+            self.state.current_term.store(term, Ordering::Relaxed);
 
+            println!("\tgrant");
             return true;
         }
+        println!("\tnot grant");
         false
     }
 
     /// try to append a entries. return the current_term in success, 0 in error.
-    pub fn append_entries(&self, args: AppendEntriesArgs) -> u64 {
+    pub fn append_entries(&self, args: AppendEntriesArgs) -> (u64, bool) {
         // if not leader, send to apply_ch to commit,
         // if is really leader, will not run into this function
         // leader should call apply_ch in state machine
@@ -739,7 +753,7 @@ impl Raft {
             }
             // return error to let leader decrease "next_index"
             else if args.prev_log_index > self.state.last_applied.load(Ordering::Relaxed) {
-                return 0;
+                return (self.state.term(), false);
             }
 
             let mut log = self.state.log.lock().unwrap();
@@ -768,9 +782,9 @@ impl Raft {
             //     log.len() as u64,
             //     self.state.last_applied.load(Ordering::Relaxed)
             // );
-            self.state.term()
+            (self.state.term(), true)
         } else {
-            self.state.term()
+            (self.state.term(), false)
         }
     }
 }
@@ -933,17 +947,17 @@ impl RaftService for Node {
     fn append_entries(&self, args: AppendEntriesArgs) -> RpcFuture<AppendEntriesReply> {
         let raft = self.raft.clone();
 
-        let term = raft.append_entries(args);
+        let (term, success) = raft.append_entries(args);
         if term > 0 {
             raft.tx.send(IncomingRpcType::AppendEntries).unwrap();
             Box::new(futures::future::result(Ok(AppendEntriesReply {
                 term,
-                success: true,
+                success,
             })))
         } else {
             Box::new(futures::future::result(Ok(AppendEntriesReply {
                 term: 0,
-                success: false,
+                success,
             })))
         }
     }
