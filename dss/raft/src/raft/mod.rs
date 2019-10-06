@@ -85,6 +85,13 @@ impl State {
         );
     }
 
+    pub fn increase_commit_index(&self) {
+        self.commit_index.store(
+            self.commit_index.load(Ordering::Relaxed) + 1,
+            Ordering::Relaxed,
+        );
+    }
+
     pub fn new(num_peers: usize) -> State {
         let mut next_index = Vec::with_capacity(num_peers);
         for _ in 0..num_peers {
@@ -305,7 +312,7 @@ impl Raft {
         // construct return value pair
         let index = self.state.commit_index.load(Ordering::Relaxed) + 1;
         let term = self.state.term();
-        self.state.commit_index.store(index, Ordering::Relaxed);
+        // self.state.commit_index.store(index, Ordering::Relaxed);
         // drop(state);
 
         // send this command to state machine.
@@ -347,6 +354,9 @@ impl Raft {
                     if clock > election_timeout {
                         // begin to send request vote RPC
                         self.state.increase_term();
+                        let mut voted_for = self.state.voted_for.lock().unwrap();
+                        *voted_for = Some(Arc::new(AtomicU64::from(self.me as u64)));
+                        drop(voted_for);
                         let request_vote_args = RequestVoteArgs {
                             term: self.get_term(),
                             candidate_id: self.me as u64,
@@ -393,6 +403,9 @@ impl Raft {
                     if clock > election_timeout {
                         // begin to send request vote RPC
                         self.state.increase_term();
+                        let mut voted_for = self.state.voted_for.lock().unwrap();
+                        *voted_for = Some(Arc::new(AtomicU64::from(self.me as u64)));
+                        drop(voted_for);
                         let request_vote_args = RequestVoteArgs {
                             term: self.get_term(),
                             candidate_id: self.me as u64,
@@ -490,6 +503,7 @@ impl Raft {
                         let next_index = self.state.get_next_index();
                         // drop(state);
                         let mut follower_tx = vec![];
+                        let leader_commit = self.state.commit_index.load(Ordering::Relaxed);
 
                         for index in 0..num_peers {
                             if index == leader_id {
@@ -516,7 +530,7 @@ impl Raft {
                                 prev_log_index,      //?
                                 prev_log_term: term, //?
                                 entries: entries_to_send,
-                                leader_commit: 0, //
+                                leader_commit, //
                             };
 
                             follower_tx.push((
@@ -589,10 +603,10 @@ impl Raft {
                             println!("received result: {}", result);
                             if result {
                                 let mut log = self.state.log.lock().unwrap();
-                                let command_index =
-                                    self.state.last_applied.load(Ordering::Relaxed) + 1;
                                 // commit command(s) into apply_ch here
                                 for entry in entries.clone() {
+                                    let command_index =
+                                        self.state.last_applied.load(Ordering::Relaxed) + 1;
                                     println!(
                                         "leader will commit {:?} with index {}",
                                         entry, command_index
@@ -607,6 +621,7 @@ impl Raft {
                                     log.push(entry);
                                     // state.last_applied += 1;
                                     self.state.increase_last_applied();
+                                    self.state.increase_commit_index();
                                 }
                                 // self.state.log = log;
                                 assert_eq!(
@@ -666,11 +681,21 @@ impl Raft {
     /// try to vote for a candidate. If success, set state and return true, else return false
     pub fn vote_for(&self, term: u64, candidate_id: u64, last_log_index: u64) -> bool {
         let mut voted_for = self.state.voted_for.lock().unwrap();
-        println!("self: {} (voted for:{:?}) received a vote request, candidate is {}, last log index is {}, own is {}",self.me,voted_for,candidate_id,last_log_index,self.state.last_applied.load(Ordering::Relaxed));
-        if self.state.term() <= term
+        print!("self: {} (voted for:{:?}) received a vote request, candidate is {}, last log index is {}, own is {}",self.me,voted_for,candidate_id,last_log_index,self.state.last_applied.load(Ordering::Relaxed));
+        println!("  term is {}, own is {}", term, self.state.term());
+        // if (self.state.term() == term
+        //     && (voted_for.is_none()
+        //         || voted_for.as_ref().unwrap().load(Ordering::Relaxed) == candidate_id)
+        //     && self.state.last_applied.load(Ordering::Relaxed) <= last_log_index)
+        //     || self.state.term() < term{}
+
+        // first look at term, if the same then look at `voted_for`, otherwise need not.
+        // after that look at index
+        if (self.state.term() == term
             && (voted_for.is_none()
-                || voted_for.as_ref().unwrap().load(Ordering::Relaxed) == candidate_id)
-            && self.state.last_applied.load(Ordering::Relaxed) <= last_log_index
+                || voted_for.as_ref().unwrap().load(Ordering::Relaxed) == candidate_id))
+            || (self.state.term() < term)
+                && self.state.last_applied.load(Ordering::Relaxed) <= last_log_index
         {
             // Arc::get_mut(&mut self.state).unwrap().voted_for = Some(candidate_id);
             // state.voted_for.set(Some(candidate_id));
@@ -703,9 +728,14 @@ impl Raft {
                 .unwrap_or_default();
             self.state.current_term.store(args.term, Ordering::Relaxed);
 
-            // no action with commends that already applied.
+            // overwrite its own log with leader's
             if args.prev_log_index < self.state.last_applied.load(Ordering::Relaxed) {
-                return self.state.term();
+                // return self.state.term();
+                let mut log = self.state.log.lock().unwrap();
+                log.truncate(args.prev_log_index as usize);
+                self.state
+                    .last_applied
+                    .store(args.prev_log_index, Ordering::Relaxed);
             }
             // return error to let leader decrease "next_index"
             else if args.prev_log_index > self.state.last_applied.load(Ordering::Relaxed) {
@@ -714,21 +744,25 @@ impl Raft {
 
             let mut log = self.state.log.lock().unwrap();
             for entry in args.entries {
+                log.push(entry);
+                self.state.increase_last_applied();
+            }
+            let leader_commit = args.leader_commit;
+            for log_index in self.state.commit_index.load(Ordering::Relaxed)..leader_commit {
                 println!(
                     "follower {} will commit {:?} with index {}",
                     self.me,
-                    entry,
-                    self.state.last_applied.load(Ordering::Relaxed) + 1
+                    log[log_index as usize],
+                    log_index + 1,
                 );
                 self.apply_ch
                     .unbounded_send(ApplyMsg {
                         command_valid: true,
-                        command: entry.clone(),
-                        command_index: self.state.last_applied.load(Ordering::Relaxed) + 1,
+                        command: log[log_index as usize].clone(),
+                        command_index: log_index + 1,
                     })
                     .unwrap();
-                log.push(entry);
-                self.state.increase_last_applied();
+                self.state.increase_commit_index();
             }
             // assert_eq!(
             //     log.len() as u64,
