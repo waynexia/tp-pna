@@ -42,7 +42,7 @@ pub struct State {
     pub voted_for: Arc<Mutex<Option<Arc<AtomicU64>>>>,
     pub is_leader: Arc<AtomicBool>,
     pub leader_id: Arc<AtomicU64>,
-    pub log: Arc<Mutex<Vec<Vec<u8>>>>,
+    pub log: Arc<Mutex<Vec<(Vec<u8>, u64)>>>,
 
     pub last_applied: Arc<AtomicU64>, // committed
     pub commit_index: Arc<AtomicU64>, // to be committed
@@ -202,7 +202,7 @@ impl Raft {
         self.state.term()
     }
 
-    pub fn get_log(&self) -> Vec<Vec<u8>> {
+    pub fn get_log(&self) -> Vec<(Vec<u8>, u64)> {
         self.state.log.lock().unwrap().to_vec()
     }
 
@@ -310,17 +310,18 @@ impl Raft {
         }
 
         // construct return value pair
-        let index = self.state.last_applied.load(Ordering::Relaxed) + 1;
+        // let index = self.state.last_applied.load(Ordering::Relaxed) + 1;
         let term = self.state.term();
-        self.state.last_applied.store(index, Ordering::Relaxed);
+        // self.state.last_applied.store(index, Ordering::Relaxed);
         // drop(state);
 
         // send this command to state machine.
         let mut buf = vec![];
         labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
         let mut log = self.state.log.lock().unwrap();
+        let index = log.len() + 1;
         println!("buf : {:?}, command: {:?}", buf, command);
-        log.push(buf);
+        log.push((buf, term));
         // self.append_tx.send(buf).unwrap();
         // self.apply_ch
         //     .unbounded_send(ApplyMsg {
@@ -330,7 +331,7 @@ impl Raft {
         //     })
         //     .unwrap();
 
-        Ok((index, term))
+        Ok((index as u64, term))
     }
 
     pub fn start_state_machine(&self) {
@@ -338,7 +339,7 @@ impl Raft {
         let mut clock: u16 = 0;
 
         let mut rng = rand::thread_rng();
-        let election_timeout = rng.gen_range(MIN_TIMEOUT, MAX_TIMEOUT);
+        let mut election_timeout = rng.gen_range(MIN_TIMEOUT, MAX_TIMEOUT);
 
         let mut server_state = ServerStates::Follower;
         let (_, rx) = channel();
@@ -359,11 +360,13 @@ impl Raft {
                         let mut voted_for = self.state.voted_for.lock().unwrap();
                         *voted_for = Some(Arc::new(AtomicU64::from(self.me as u64)));
                         drop(voted_for);
+                        let last_log_term =
+                            self.get_log().as_slice().last().unwrap_or(&(vec![], 0)).1;
                         let request_vote_args = RequestVoteArgs {
                             term: self.get_term(),
                             candidate_id: self.me as u64,
                             last_log_index: self.state.last_applied.load(Ordering::Relaxed),
-                            last_log_term: 0, //?
+                            last_log_term, //?
                         };
                         let mut teller = vec![];
                         for server_index in 0..self.peers.len() {
@@ -395,6 +398,7 @@ impl Raft {
                         });
 
                         clock = 0;
+                        election_timeout = rng.gen_range(MIN_TIMEOUT, MAX_TIMEOUT);
                         server_state = ServerStates::Candidate;
                         teller_rx = rx;
                         wating_vote_result = true;
@@ -408,11 +412,13 @@ impl Raft {
                         let mut voted_for = self.state.voted_for.lock().unwrap();
                         *voted_for = Some(Arc::new(AtomicU64::from(self.me as u64)));
                         drop(voted_for);
+                        let last_log_term =
+                            self.get_log().as_slice().last().unwrap_or(&(vec![], 0)).1;
                         let request_vote_args = RequestVoteArgs {
                             term: self.get_term(),
                             candidate_id: self.me as u64,
                             last_log_index: self.state.last_applied.load(Ordering::Relaxed),
-                            last_log_term: 0, //?
+                            last_log_term,
                         };
                         let mut teller = vec![];
                         for server_index in 0..self.peers.len() {
@@ -426,6 +432,7 @@ impl Raft {
 
                         let (tx, rx) = channel();
                         let majority = self.majority;
+                        let candidate_term = self.state.current_term.clone();
                         thread::spawn(move || {
                             // spawn a new thread to listen response from others and counts votes
                             let mut cnt = 1; // 1 for self
@@ -435,6 +442,16 @@ impl Raft {
                                         if let Ok(request_vote_reply) = response {
                                             if request_vote_reply.vote_granted {
                                                 cnt += 1;
+                                                if cnt >= majority {
+                                                    if tx.send(true).is_err() {}
+                                                }
+                                            } else if request_vote_reply.term
+                                                > candidate_term.load(Ordering::Relaxed)
+                                            {
+                                                candidate_term.store(
+                                                    request_vote_reply.term,
+                                                    Ordering::Relaxed,
+                                                );
                                             }
                                         }
                                         return false;
@@ -446,6 +463,7 @@ impl Raft {
                         });
 
                         clock = 0;
+                        election_timeout = rng.gen_range(MIN_TIMEOUT, MAX_TIMEOUT);
                         teller_rx = rx;
                         wating_vote_result = true;
                     }
@@ -458,7 +476,7 @@ impl Raft {
                                 drop(voted_for);
                                 self.state.is_leader.store(true, Ordering::Relaxed);
                                 self.state.reinit_next_index();
-                                clock = 0;
+                                clock = HEARTBEAT_INTERVAL + 1;
                             }
                             wating_vote_result = false;
                         }
@@ -506,6 +524,11 @@ impl Raft {
                         // drop(state);
                         let mut follower_tx = vec![];
                         let leader_commit = self.state.commit_index.load(Ordering::Relaxed);
+                        let log = self.get_log();
+                        let log_length = log.len();
+                        self.state
+                            .last_applied
+                            .store(log_length as u64, Ordering::Relaxed);
 
                         for index in 0..num_peers {
                             if index == leader_id {
@@ -513,7 +536,6 @@ impl Raft {
                             }
 
                             // construct entry list by `next_index` for every single peer
-                            let log = self.get_log();
                             let prev_log_index = next_index[index];
                             // let entries_to_send = [
                             //     if log.len() > 0 {
@@ -524,8 +546,11 @@ impl Raft {
                             //     entries.clone(),
                             // ]
                             // .concat();
-                            let entries_to_send = if log.len() > 0 {
-                                log[next_index[index] as usize..].to_vec()
+                            let entries_to_send = if log_length > 0 {
+                                log[next_index[index] as usize..log_length]
+                                    .into_iter()
+                                    .map(|(log, _)| log.clone())
+                                    .collect()
                             } else {
                                 vec![]
                             };
@@ -606,7 +631,7 @@ impl Raft {
                     }
                     if wating_append_result {
                         if let Ok(result) = append_entries_rx.try_recv() {
-                            println!("received result: {}", result);
+                            println!("{} received result: {}", self.me, result);
                             if result {
                                 let log = self.get_log();
                                 // commit command(s) into apply_ch here
@@ -616,7 +641,7 @@ impl Raft {
                                 {
                                     // let command_index =
                                     //     self.state.commit_index.load(Ordering::Relaxed) + 1;
-                                    let command = log[command_index as usize].clone();
+                                    let command = log[command_index as usize].0.clone();
                                     println!(
                                         "leader will commit {:?} with index {}",
                                         command,
@@ -654,8 +679,9 @@ impl Raft {
                     if signal == IncomingRpcType::RequestVote {
                         // need to judge term
                         server_state = ServerStates::Follower;
-                        let mut voted_for = self.state.voted_for.lock().unwrap();
-                        *voted_for = None;
+                        wating_vote_result = false;
+                        // let mut voted_for = self.state.voted_for.lock().unwrap();
+                        // *voted_for = None;
                     }
                     clock = 0;
                 }
@@ -690,7 +716,13 @@ impl Raft {
     }
 
     /// try to vote for a candidate. If success, set state and return true, else return false
-    pub fn vote_for(&self, term: u64, candidate_id: u64, last_log_index: u64) -> bool {
+    pub fn vote_for(
+        &self,
+        term: u64,
+        candidate_id: u64,
+        last_log_index: u64,
+        last_log_term: u64,
+    ) -> bool {
         let mut voted_for = self.state.voted_for.lock().unwrap();
         print!("self: {} (voted for:{:?}) received a vote request, candidate is {}, last log index is {}, own is {}",self.me,voted_for,candidate_id,last_log_index,self.state.last_applied.load(Ordering::Relaxed));
         print!("  term is {}, own is {}", term, self.state.term());
@@ -702,11 +734,18 @@ impl Raft {
 
         // first look at term, if the same then look at `voted_for`, otherwise need not.
         // after that look at index
+        let self_last_log_term = self.get_log().as_slice().last().unwrap_or(&(vec![], 0)).1;
+        print!(
+            ", last log term is {}, its own is {}",
+            last_log_term, self_last_log_term
+        );
         if (self.state.term() == term
             && (voted_for.is_none()
                 || voted_for.as_ref().unwrap().load(Ordering::Relaxed) == candidate_id))
-            || (self.state.term() < term)
-                && self.state.last_applied.load(Ordering::Relaxed) <= last_log_index
+            || self.state.term() < term
+                && (self_last_log_term < last_log_term
+                    || (self_last_log_term == last_log_term
+                        && self.state.last_applied.load(Ordering::Relaxed) <= last_log_index))
         {
             // Arc::get_mut(&mut self.state).unwrap().voted_for = Some(candidate_id);
             // state.voted_for.set(Some(candidate_id));
@@ -719,6 +758,7 @@ impl Raft {
             return true;
         }
         println!("\tnot grant");
+        self.state.current_term.store(term, Ordering::Relaxed);
         false
     }
 
@@ -742,6 +782,29 @@ impl Raft {
                 .unwrap_or_default();
             self.state.current_term.store(args.term, Ordering::Relaxed);
 
+            // truncate log to last_applied
+            let mut log = self.state.log.lock().unwrap();
+            log.truncate(self.state.last_applied.load(Ordering::Relaxed) as usize);
+            // remove log with not compatible term
+            while !log.is_empty() {
+                if log.as_slice().last().unwrap().1 != args.term
+                    && log.len() as u64 > self.state.commit_index.load(Ordering::Relaxed)
+                {
+                    let to_print = log.pop();
+                    println!(
+                        "follower {} will pop entry {:?} from its log",
+                        self.me, to_print
+                    );
+                    self.state.last_applied.store(
+                        self.state.last_applied.load(Ordering::Relaxed) - 1,
+                        Ordering::Relaxed,
+                    );
+                } else {
+                    break;
+                }
+            }
+            drop(log);
+
             // overwrite its own log with leader's
             if args.prev_log_index < self.state.last_applied.load(Ordering::Relaxed) {
                 // return self.state.term();
@@ -758,7 +821,7 @@ impl Raft {
 
             let mut log = self.state.log.lock().unwrap();
             for entry in args.entries {
-                log.push(entry);
+                log.push((entry, self.get_term()));
                 self.state.increase_last_applied();
             }
             let leader_commit = args.leader_commit;
@@ -772,7 +835,7 @@ impl Raft {
                 self.apply_ch
                     .unbounded_send(ApplyMsg {
                         command_valid: true,
-                        command: log[log_index as usize].clone(),
+                        command: log[log_index as usize].0.clone(),
                         command_index: log_index + 1,
                     })
                     .unwrap();
@@ -930,7 +993,12 @@ impl RaftService for Node {
         let raft = self.raft.clone();
         let term = raft.get_term();
 
-        if raft.vote_for(args.term, args.candidate_id, args.last_log_index) {
+        if raft.vote_for(
+            args.term,
+            args.candidate_id,
+            args.last_log_index,
+            args.last_log_term,
+        ) {
             raft.tx.send(IncomingRpcType::RequestVote).unwrap();
             Box::new(futures::future::result(Ok(RequestVoteReply {
                 term,
