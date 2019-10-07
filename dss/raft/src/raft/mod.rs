@@ -603,6 +603,9 @@ impl Raft {
                                             }
                                             if append_entries_reply.success {
                                                 cnt += 1;
+                                                if cnt >= majority{
+                                                    tx.send(true).unwrap_or_default();
+                                                }
                                             }
                                             reply.push((
                                                 index.to_owned(),
@@ -674,8 +677,8 @@ impl Raft {
             }
 
             // try to receive heartbeat
-            if !self.is_leader() {
-                if let Ok(signal) = self.rx.try_recv() {
+            while let Ok(signal) = self.rx.try_recv() {
+                if !self.is_leader() {
                     if signal == IncomingRpcType::RequestVote {
                         // need to judge term
                         server_state = ServerStates::Follower;
@@ -683,14 +686,11 @@ impl Raft {
                         // let mut voted_for = self.state.voted_for.lock().unwrap();
                         // *voted_for = None;
                     }
-                    clock = 0;
-                }
-            } else if let Ok(signal) = self.rx.try_recv() {
-                if signal == IncomingRpcType::TurnToFollower {
+                } else if signal == IncomingRpcType::TurnToFollower {
                     // need to judge term
                     server_state = ServerStates::Follower;
                     println!(
-                        "{}, term: {} will turn to follower",
+                        "leader {}, term: {} will turn to follower",
                         self.me,
                         self.get_term()
                     );
@@ -698,6 +698,7 @@ impl Raft {
                     *voted_for = None;
                     self.state.is_leader.store(false, Ordering::Relaxed);
                 }
+                // and IncomingRpcType::AppendEntries
                 clock = 0;
             }
 
@@ -752,6 +753,11 @@ impl Raft {
             // state.get_mut().vote_for = Some(candidate_id);
             // state.voted_for = Some(candidate_id);
             *voted_for = Some(Arc::new(AtomicU64::from(candidate_id)));
+            if self.state.term() < term {
+                self.tx
+                    .send(IncomingRpcType::TurnToFollower)
+                    .unwrap_or_default();
+            }
             self.state.current_term.store(term, Ordering::Relaxed);
 
             println!("\tgrant");
