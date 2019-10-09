@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package raftpb;
 
-// Example RequestVote RPC arguments structure.
+// RequestVote RPC
 message RequestVoteArgs {
     // Your data here (2A, 2B).
     uint64 term = 1;
@@ -11,7 +11,6 @@ message RequestVoteArgs {
     uint64 lastLogTerm = 4;
 }
 
-// Example RequestVote RPC reply structure.
 message RequestVoteReply {
     // Your data here (2A).
     uint64 term = 1;
@@ -24,7 +23,7 @@ message AppendEntriesArgs {
     uint64 leaderId = 2;
     uint64 prevLogIndex = 3;
     uint64 prevLogTerm = 4;
-    repeated bytes entries = 5; // type of entry?
+    repeated bytes entries = 5;
     uint64 leaderCommit = 6;
 }
 

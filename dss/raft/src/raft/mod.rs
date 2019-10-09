@@ -21,6 +21,7 @@ mod tests;
 use self::errors::*;
 use self::persister::*;
 use crate::proto::raftpb::*;
+use crate::proto::PresistentState;
 
 const MIN_TIMEOUT: u16 = 200;
 const MAX_TIMEOUT: u16 = 350;
@@ -39,9 +40,8 @@ type LogEntry = (Vec<u8>, u64);
 /// State of a raft peer.
 #[derive(Clone, Debug)]
 pub struct State {
-    // pub current_term: u64,
     pub current_term: Arc<AtomicU64>,
-    pub voted_for: Arc<Mutex<Option<Arc<AtomicU64>>>>,
+    pub voted_for: Arc<Mutex<Option<u64>>>,
     pub is_leader: Arc<AtomicBool>,
     pub leader_id: Arc<AtomicU64>,
     pub log: Arc<Mutex<Vec<LogEntry>>>,
@@ -71,6 +71,10 @@ impl State {
 
     pub fn get_next_index(&self) -> Vec<u64> {
         self.next_index.lock().unwrap().to_vec()
+    }
+
+    pub fn get_voted_for(&self) -> Option<u64> {
+        *self.voted_for.lock().unwrap()
     }
 
     pub fn increase_term(&self) {
@@ -142,7 +146,7 @@ pub struct Raft {
     // RPC end points of all peers
     peers: Vec<RaftClient>,
     // Object to hold this peer's persisted state
-    // persister: Box<dyn Persister + Sync>,
+    persister: Arc<Mutex<Box<dyn Persister>>>,
     // this peer's index into peers[]
     me: usize,
     state: State,
@@ -175,9 +179,9 @@ impl Raft {
         let (tx, rx) = bounded(1);
         let majority = (peers.len() + 1) / 2;
         let num_peers = peers.len();
-        let mut raft = Raft {
+        let raft = Raft {
             peers,
-            // persister,
+            persister: Arc::new(Mutex::new(persister)),
             me,
             state: State::new(num_peers),
             tx,
@@ -204,16 +208,37 @@ impl Raft {
     /// save Raft's persistent state to stable storage,
     /// where it can later be retrieved after a crash and restart.
     /// see paper's Figure 2 for a description of what should be persistent.
-    fn persist(&mut self) {
+    fn persist(&self) {
         // Your code here (2C).
         // Example:
         // labcodec::encode(&self.xxx, &mut data).unwrap();
         // labcodec::encode(&self.yyy, &mut data).unwrap();
-        // self.persister.save_raft_state(data);
+        let mut data = vec![];
+
+        // seperate log into two vector for presisting
+        let mut sep_log = vec![];
+        let mut sep_term = vec![];
+        let log = self.state.log.lock().unwrap();
+        for index in 0..log.len() {
+            let (l, t) = log[index].clone();
+            sep_log.push(l.clone());
+            sep_term.push(t);
+        }
+
+        let presistent_state = PresistentState {
+            current_term: self.get_term(),
+            voted_for: self.state.get_voted_for(),
+            log: sep_log,
+            log_term: sep_term,
+        };
+
+        labcodec::encode(&presistent_state, &mut data).unwrap();
+
+        self.persister.lock().unwrap().save_raft_state(data);
     }
 
     /// restore previously persisted state.
-    fn restore(&mut self, data: &[u8]) {
+    fn restore(&self, data: &[u8]) {
         if data.is_empty() {
             // bootstrap without any state?
             return;
@@ -229,6 +254,32 @@ impl Raft {
         //         panic!("{:?}", e);
         //     }
         // }
+        match labcodec::decode::<PresistentState>(data) {
+            Ok(presistent_state) => {
+                self.state
+                    .current_term
+                    .store(presistent_state.current_term, Ordering::Relaxed);
+                let mut voted_for = self.state.voted_for.lock().unwrap();
+                if let Some(voted) = presistent_state.voted_for {
+                    *voted_for = Some(voted);
+                } else {
+                    *voted_for = None;
+                }
+                // construct tuple from two seperated vector
+                let mut new_log = vec![];
+                for index in 0..presistent_state.log.len() {
+                    new_log.push((
+                        presistent_state.log[index].clone(),
+                        presistent_state.log_term[index],
+                    ));
+                }
+                let mut log = self.state.log.lock().unwrap();
+                *log = new_log;
+            }
+            Err(e) => {
+                panic!("{:?}", e);
+            }
+        }
     }
 
     /// example code to send a RequestVote RPC to a server.
@@ -326,6 +377,7 @@ impl Raft {
             match server_state {
                 ServerStates::Follower => {
                     server_state = ServerStates::Candidate;
+                    continue;
                 }
 
                 ServerStates::Candidate => {
@@ -333,7 +385,7 @@ impl Raft {
                         // begin to send request vote RPC
                         self.state.increase_term();
                         let mut voted_for = self.state.voted_for.lock().unwrap();
-                        *voted_for = Some(Arc::new(AtomicU64::from(self.me as u64)));
+                        *voted_for = Some(self.me as u64);
                         drop(voted_for);
                         let last_log_term =
                             self.get_log().as_slice().last().unwrap_or(&(vec![], 0)).1;
@@ -619,14 +671,13 @@ impl Raft {
             last_log_term, self_last_log_term
         );
         if (self.state.term() == term
-            && (voted_for.is_none()
-                || voted_for.as_ref().unwrap().load(Ordering::Relaxed) == candidate_id))
+            && (voted_for.is_none() || *voted_for.as_ref().unwrap() == candidate_id))
             || self.state.term() < term
                 && (self_last_log_term < last_log_term
                     || (self_last_log_term == last_log_term
                         && self.state.last_applied.load(Ordering::Relaxed) <= last_log_index))
         {
-            *voted_for = Some(Arc::new(AtomicU64::from(candidate_id)));
+            *voted_for = Some(candidate_id);
             if self.state.term() < term {
                 self.tx
                     .send(IncomingRpcType::TurnToFollower)
@@ -765,14 +816,7 @@ pub struct Node {
 impl Node {
     /// Create a new raft service.
     pub fn new(raft: Raft) -> Node {
-        /* some code to spawn a new thread for ratf to run */
-        // thread::spawn(|| {
-        //     raft.start_state_machine();
-        // });
-        // Your code here.
-        // crate::your_code_here(raft)
         let raft = Arc::new(raft);
-
         let r = raft.clone();
         thread::spawn(move || {
             let raft = r;
@@ -829,7 +873,7 @@ impl Node {
     /// a VIRTUAL crash in tester, so take care of background
     /// threads you generated with this Raft Node.
     pub fn kill(&self) {
-        // Your code here, if desired.
+        // need to stop state machine thread?
     }
 }
 
