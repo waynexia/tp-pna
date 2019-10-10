@@ -1,6 +1,6 @@
 use std::default::Default;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -98,6 +98,22 @@ impl State {
         );
     }
 
+    pub fn adjust_next_index(&self, feedback: Vec<(usize, bool)>) {
+        for (index, accept) in feedback {
+            let mut next_index = self.next_index.lock().unwrap();
+            if accept {
+                next_index[index] = self.commit_index.load(Ordering::Relaxed);
+            } else {
+                next_index[index] = if next_index[index] > 0 {
+                    next_index[index] - 1
+                } else {
+                    0
+                };
+            }
+            drop(next_index);
+        }
+    }
+
     pub fn new(num_peers: usize) -> State {
         let mut next_index = Vec::with_capacity(num_peers);
         for _ in 0..num_peers {
@@ -139,6 +155,7 @@ pub enum IncomingRpcType {
     AppendEntries,
     RequestVote,
     TurnToFollower,
+    Stop,
 }
 
 // A single Raft peer.
@@ -213,32 +230,40 @@ impl Raft {
         // Example:
         // labcodec::encode(&self.xxx, &mut data).unwrap();
         // labcodec::encode(&self.yyy, &mut data).unwrap();
+        debug!("will presist peer {}", self.me);
         let mut data = vec![];
 
         // seperate log into two vector for presisting
         let mut sep_log = vec![];
         let mut sep_term = vec![];
-        let log = self.state.log.lock().unwrap();
-        for index in 0..log.len() {
-            let (l, t) = log[index].clone();
+        let log = self.get_log();
+        for (l, t) in log {
             sep_log.push(l.clone());
             sep_term.push(t);
         }
 
+        debug!("log seperated");
+        let voted_for = self.state.get_voted_for();
+        debug!("get voted for");
+
         let presistent_state = PresistentState {
             current_term: self.get_term(),
-            voted_for: self.state.get_voted_for(),
+            voted_for,
             log: sep_log,
             log_term: sep_term,
         };
 
         labcodec::encode(&presistent_state, &mut data).unwrap();
+        debug!("{} will call presister", self.me);
 
         self.persister.lock().unwrap().save_raft_state(data);
+
+        debug!("{} presisted!", self.me);
     }
 
     /// restore previously persisted state.
     fn restore(&self, data: &[u8]) {
+        debug!("data for restoring: {:?}", data);
         if data.is_empty() {
             // bootstrap without any state?
             return;
@@ -265,6 +290,7 @@ impl Raft {
                 } else {
                     *voted_for = None;
                 }
+                drop(voted_for);
                 // construct tuple from two seperated vector
                 let mut new_log = vec![];
                 for index in 0..presistent_state.log.len() {
@@ -275,6 +301,7 @@ impl Raft {
                 }
                 let mut log = self.state.log.lock().unwrap();
                 *log = new_log;
+                debug!("recovered state of peer {} : {:?}", self.me, self.state);
             }
             Err(e) => {
                 panic!("{:?}", e);
@@ -351,10 +378,15 @@ impl Raft {
         labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
         let mut log = self.state.log.lock().unwrap();
         let index = log.len() + 1;
-        println!("buf : {:?}, command: {:?}", buf, command);
+        debug!("buf : {:?}, command: {:?}", buf, command);
         log.push((buf, term));
 
         Ok((index as u64, term))
+    }
+
+    /// stop background state machine thread
+    pub fn stop(&self) {
+        self.tx.send(IncomingRpcType::Stop).unwrap();
     }
 
     pub fn start_state_machine(&self) {
@@ -373,7 +405,10 @@ impl Raft {
         let mut wating_vote_result = false;
         let mut wating_append_result = false;
 
-        loop {
+        // this raft instance is killed or not
+        let mut killed = false;
+
+        while !killed {
             match server_state {
                 ServerStates::Follower => {
                     server_state = ServerStates::Candidate;
@@ -465,21 +500,8 @@ impl Raft {
                         let majority = self.majority;
 
                         // adjust last_applied based on reply from last AppendEntriesRpc
-                        if let Ok(adjust) = append_entries_reply_rx.try_recv() {
-                            for (index, accept) in adjust {
-                                let mut next_index = self.state.next_index.lock().unwrap();
-                                if accept {
-                                    next_index[index] =
-                                        self.state.commit_index.load(Ordering::Relaxed);
-                                } else {
-                                    next_index[index] = if next_index[index] > 0 {
-                                        next_index[index] - 1
-                                    } else {
-                                        0
-                                    };
-                                }
-                                drop(next_index);
-                            }
+                        if let Ok(feedback) = append_entries_reply_rx.try_recv() {
+                            self.state.adjust_next_index(feedback);
                         }
                         let next_index = self.state.get_next_index();
                         let mut follower_tx = vec![];
@@ -524,7 +546,7 @@ impl Raft {
                             ));
                         }
 
-                        // spawn a new thread to listen response from follower's response
+                        // spawn a new thread to listen response from followers
                         let append_entries_reply_tx = append_entries_reply_tx.clone();
                         let tx = tx.clone();
                         // if a follower's reply contains a term greater than leader, send
@@ -532,50 +554,15 @@ impl Raft {
                         let step_down_tx = self.tx.clone();
                         let leader_term = self.state.current_term.clone();
                         thread::spawn(move || {
-                            let mut cnt = 1;
-                            let mut clock = 0;
-                            let mut reply = vec![];
-                            while !follower_tx.is_empty() {
-                                follower_tx.retain(|(rcv, index)| {
-                                    if let Ok(response) = rcv.try_recv() {
-                                        if let Ok(append_entries_reply) = response {
-                                            if append_entries_reply.term
-                                                > leader_term.load(Ordering::Relaxed)
-                                            {
-                                                println!("leader received a append reply with term {}, which is greater than {}",append_entries_reply.term,leader_term.load(Ordering::Relaxed));
-                                                leader_term.store(
-                                                    append_entries_reply.term,
-                                                    Ordering::Relaxed,
-                                                );
-                                                step_down_tx
-                                                    .send(IncomingRpcType::TurnToFollower)
-                                                    .unwrap_or_default();
-                                            }
-                                            if append_entries_reply.success {
-                                                cnt += 1;
-                                                if cnt >= majority{
-                                                    tx.send(true).unwrap_or_default();
-                                                }
-                                            }
-                                            reply.push((
-                                                index.to_owned(),
-                                                append_entries_reply.success,
-                                            ));
-                                        }
-                                        return false;
-                                    }
-                                    true
-                                });
-
-                                // end for this time
-                                if clock > APPEND_LISTEN_PERIOD {
-                                    break;
-                                }
-                                clock += 1;
-                                thread::sleep(action_interval);
-                            }
-                            tx.send(cnt >= majority).unwrap_or_default();
-                            append_entries_reply_tx.send(reply).unwrap_or_default();
+                            Raft::listen_follower_response(
+                                follower_tx,
+                                leader_term,
+                                step_down_tx,
+                                majority as u64,
+                                tx,
+                                action_interval,
+                                append_entries_reply_tx,
+                            )
                         });
 
                         clock = 0;
@@ -584,7 +571,7 @@ impl Raft {
                     }
                     if wating_append_result {
                         if let Ok(result) = append_entries_rx.try_recv() {
-                            println!("{} received result: {}", self.me, result);
+                            debug!("{} received result: {}", self.me, result);
                             if result {
                                 let log = self.get_log();
                                 // commit command(s) into apply_ch here
@@ -592,7 +579,7 @@ impl Raft {
                                     ..self.state.last_applied.load(Ordering::Relaxed)
                                 {
                                     let command = log[command_index as usize].0.clone();
-                                    println!(
+                                    debug!(
                                         "leader will commit {:?} with index {}",
                                         command,
                                         command_index + 1
@@ -606,6 +593,7 @@ impl Raft {
                                         .unwrap();
                                     self.state.increase_commit_index();
                                 }
+                                self.persist();
                                 clock = 0;
                                 wating_append_result = false;
                             }
@@ -614,29 +602,12 @@ impl Raft {
                 }
             }
 
-            // try to receive heartbeat
-            while let Ok(signal) = self.rx.try_recv() {
-                if !self.is_leader() {
-                    if signal == IncomingRpcType::RequestVote {
-                        // need to judge term
-                        server_state = ServerStates::Follower;
-                        wating_vote_result = false;
-                    }
-                } else if signal == IncomingRpcType::TurnToFollower {
-                    // need to judge term
-                    server_state = ServerStates::Follower;
-                    println!(
-                        "leader {}, term: {} will turn to follower",
-                        self.me,
-                        self.get_term()
-                    );
-                    let mut voted_for = self.state.voted_for.lock().unwrap();
-                    *voted_for = None;
-                    self.state.is_leader.store(false, Ordering::Relaxed);
-                }
-                // and IncomingRpcType::AppendEntries
-                clock = 0;
-            }
+            self.listen_incomming_message(
+                &mut killed,
+                &mut server_state,
+                &mut clock,
+                &mut wating_vote_result,
+            );
 
             clock += 1;
             thread::sleep(action_interval);
@@ -660,13 +631,13 @@ impl Raft {
         last_log_term: u64,
     ) -> bool {
         let mut voted_for = self.state.voted_for.lock().unwrap();
-        print!("self: {} (voted for:{:?}) received a vote request, candidate is {}, last log index is {}, own is {}",self.me,voted_for,candidate_id,last_log_index,self.state.last_applied.load(Ordering::Relaxed));
-        print!("  term is {}, own is {}", term, self.state.term());
+        debug!("self: {} (voted for:{:?}) received a vote request, candidate is {}, last log index is {}, own is {}",self.me,voted_for,candidate_id,last_log_index,self.state.last_applied.load(Ordering::Relaxed));
+        debug!("  term is {}, own is {}", term, self.state.term());
 
         // first look at term, if the same then look at `voted_for`, otherwise need not.
         // after that look at index
         let self_last_log_term = self.get_log().as_slice().last().unwrap_or(&(vec![], 0)).1;
-        print!(
+        debug!(
             ", last log term is {}, its own is {}",
             last_log_term, self_last_log_term
         );
@@ -685,10 +656,10 @@ impl Raft {
             }
             self.state.current_term.store(term, Ordering::Relaxed);
 
-            println!("\tgrant");
+            debug!("\tgrant");
             return true;
         }
-        println!("\tnot grant");
+        debug!("\tnot grant");
         self.state.current_term.store(term, Ordering::Relaxed);
         false
     }
@@ -699,7 +670,7 @@ impl Raft {
         // if is really leader, will not run into this function
         // leader should call apply_ch in state machine
 
-        println!(
+        debug!(
             "No. {} (last applied: {}, term: {}) received {:?}",
             self.me,
             self.state.last_applied.load(Ordering::Relaxed),
@@ -722,7 +693,7 @@ impl Raft {
                     && log.len() as u64 > self.state.commit_index.load(Ordering::Relaxed)
                 {
                     let to_print = log.pop();
-                    println!(
+                    debug!(
                         "follower {} will pop entry {:?} from its log",
                         self.me, to_print
                     );
@@ -754,9 +725,11 @@ impl Raft {
                 log.push((entry, self.get_term()));
                 self.state.increase_last_applied();
             }
+            drop(log);
+            let log = self.get_log();
             let leader_commit = args.leader_commit;
             for log_index in self.state.commit_index.load(Ordering::Relaxed)..leader_commit {
-                println!(
+                debug!(
                     "follower {} will commit {:?} with index {}",
                     self.me,
                     log[log_index as usize],
@@ -770,10 +743,104 @@ impl Raft {
                     })
                     .unwrap();
                 self.state.increase_commit_index();
+                self.persist();
             }
             (self.state.term(), true)
         } else {
             (self.state.term(), false)
+        }
+    }
+
+    // a method used in state machine
+    fn listen_follower_response(
+        mut follower_tx: Vec<(Receiver<Result<AppendEntriesReply>>, usize)>,
+        leader_term: Arc<AtomicU64>,
+        step_down_tx: CSender<IncomingRpcType>,
+        majority: u64,
+        tx: Sender<bool>,
+        action_interval: std::time::Duration,
+        append_entries_reply_tx: Sender<Vec<(usize, bool)>>,
+    ) {
+        let mut cnt = 1;
+        let mut clock = 0;
+        let mut reply = vec![];
+        while !follower_tx.is_empty() {
+            follower_tx.retain(|(rcv, index)| {
+                if let Ok(response) = rcv.try_recv() {
+                    if let Ok(append_entries_reply) = response {
+                        if append_entries_reply.term
+                            > leader_term.load(Ordering::Relaxed)
+                        {
+                            debug!("leader received a append reply with term {}, which is greater than {}",append_entries_reply.term,leader_term.load(Ordering::Relaxed));
+                            leader_term.store(
+                                append_entries_reply.term,
+                                Ordering::Relaxed,
+                            );
+                            step_down_tx
+                                .send(IncomingRpcType::TurnToFollower)
+                                .unwrap_or_default();
+                        }
+                        if append_entries_reply.success {
+                            cnt += 1;
+                            if cnt >= majority{
+                                tx.send(true).unwrap_or_default();
+                            }
+                        }
+                        reply.push((
+                            index.to_owned(),
+                            append_entries_reply.success,
+                        ));
+                    }
+                    return false;
+                }
+                true
+            });
+
+            // end for this time
+            if clock > APPEND_LISTEN_PERIOD {
+                break;
+            }
+            clock += 1;
+            thread::sleep(action_interval);
+        }
+        tx.send(cnt >= majority).unwrap_or_default();
+        append_entries_reply_tx.send(reply).unwrap_or_default();
+    }
+
+    fn listen_incomming_message(
+        &self,
+        killed: &mut bool,
+        server_state: &mut ServerStates,
+        clock: &mut u16,
+        wating_vote_result: &mut bool,
+    ) {
+        // try to receive heartbeat
+        while let Ok(signal) = self.rx.try_recv() {
+            if signal == IncomingRpcType::Stop {
+                *killed = true;
+                break;
+            }
+            if !self.is_leader() {
+                if signal == IncomingRpcType::RequestVote {
+                    // need to judge term
+                    *server_state = ServerStates::Follower;
+                    *wating_vote_result = false;
+                }
+            } else if signal == IncomingRpcType::TurnToFollower {
+                // need to judge term
+                *server_state = ServerStates::Follower;
+                debug!(
+                    "leader {}, term: {} will turn to follower",
+                    self.me,
+                    self.get_term()
+                );
+                let mut voted_for = self.state.voted_for.lock().unwrap();
+                *voted_for = None;
+                drop(voted_for);
+                self.state.is_leader.store(false, Ordering::Relaxed);
+            }
+            // and IncomingRpcType::AppendEntries
+            *clock = 0;
         }
     }
 }
@@ -810,7 +877,6 @@ impl Raft {
 pub struct Node {
     // Your code here.
     raft: Arc<Raft>,
-    // raft: Raft,
 }
 
 impl Node {
@@ -874,6 +940,7 @@ impl Node {
     /// threads you generated with this Raft Node.
     pub fn kill(&self) {
         // need to stop state machine thread?
+        self.raft.stop();
     }
 }
 
