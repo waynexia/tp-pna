@@ -556,10 +556,12 @@ impl Raft {
                             info!("{} received result: {}", self.me, result);
                             if result {
                                 let log = self.get_log();
+                                let mut have_new_commit = false;
                                 // commit command(s) into apply_ch here
                                 for command_index in self.state.commit_index.load(Ordering::Relaxed)
                                     ..self.state.last_applied.load(Ordering::Relaxed)
                                 {
+                                    have_new_commit = true;
                                     let command = log[command_index as usize].0.clone();
                                     info!(
                                         "leader {} will commit {:?} with index {}",
@@ -575,6 +577,8 @@ impl Raft {
                                         })
                                         .unwrap();
                                     self.state.increase_commit_index();
+                                }
+                                if have_new_commit {
                                     self.persist();
                                 }
                                 clock = 0;
@@ -605,9 +609,10 @@ impl Raft {
         Arc::new(self.state.clone())
     }
 
+    // the first log's index is 1
     fn get_log_term_by_index(&self, index: u64) -> u64 {
         let log = self.get_log();
-        if log.len() as u64 > index && index != 0 {
+        if log.len() as u64 >= index && index != 0 {
             log[index as usize - 1].1
         } else {
             0
@@ -633,9 +638,7 @@ impl Raft {
                 while prev_term_index > 0
                     && self.get_log_term_by_index(prev_term_index - 1) == this_term
                 {
-                    // if prev_term_index > 1 && self.get_log_term_by_index(prev_term_index - 1) == this_term{
                     prev_term_index -= 1;
-                    // }
                 }
                 next_index[index] = prev_term_index;
             }
@@ -709,37 +712,19 @@ impl Raft {
                 .unwrap_or_default();
             self.state.current_term.store(args.term, Ordering::Relaxed);
 
-            // deadcode in fact
-            // truncate log to last_applied
-            // let mut log = self.state.log.lock().unwrap();
-            // log.truncate(self.state.last_applied.load(Ordering::Relaxed) as usize);
-            // // remove log with not compatible term
-            // while !log.is_empty() {
-            //     if log.as_slice().last().unwrap().1 != args.term
-            //         && log.len() as u64 > self.state.last_applied.load(Ordering::Relaxed)
-            //     {
-            //         let to_print = log.pop();
-            //         info!(
-            //             "follower {} will pop entry {:?} from its log",
-            //             self.me, to_print
-            //         );
-            //         self.state.last_applied.store(
-            //             self.state.last_applied.load(Ordering::Relaxed) - 1,
-            //             Ordering::Relaxed,
-            //         );
-            //     } else {
-            //         break;
-            //     }
-            // }
-            // drop(log);
-
             // return error to let leader decrease "next_index"
             let prev_log_term = self.get_log_term_by_index(args.prev_log_index);
+            info!(
+                "arg.prev_index: {}, term: {}, self.prev_index: {}, term: {}",
+                args.prev_log_index,
+                args.prev_log_term,
+                self.state.last_applied.load(Ordering::Relaxed),
+                prev_log_term
+            );
             if args.prev_log_index > self.state.last_applied.load(Ordering::Relaxed)
                 || (args.prev_log_term != prev_log_term && prev_log_term != 0)
-            // && args.prev_log_term != 0)
             {
-                info!("not received");
+                info!("reject append entries rpc");
                 return (self.state.term(), false);
             }
             // overwrite its own log with leader's
@@ -760,11 +745,13 @@ impl Raft {
                 self.state.increase_last_applied();
             }
             drop(log);
-            self.persist();
+            // self.persist();
 
             let log = self.get_log();
             let leader_commit = args.leader_commit;
+            let mut have_new_log = false;
             for log_index in self.state.commit_index.load(Ordering::Relaxed)..leader_commit {
+                have_new_log = true;
                 info!(
                     "follower {} will commit {:?} with index {}",
                     self.me,
@@ -779,6 +766,8 @@ impl Raft {
                     })
                     .unwrap();
                 self.state.increase_commit_index();
+            }
+            if have_new_log {
                 self.persist();
             }
             (self.state.term(), true)
