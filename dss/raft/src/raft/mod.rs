@@ -344,7 +344,13 @@ impl Raft {
         labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
         let mut log = self.state.log.lock().unwrap();
         let index = log.len() + 1;
-        info!("buf : {:?}, command: {:?}", buf, command);
+        info!(
+            "{}, term: {}, buf : {:?}, command: {:?}",
+            self.me,
+            self.get_term(),
+            buf,
+            command
+        );
         log.push((buf, term));
 
         Ok((index as u64, term))
@@ -438,8 +444,7 @@ impl Raft {
                         election_timeout = rng.gen_range(MIN_TIMEOUT, MAX_TIMEOUT);
                         teller_rx = rx;
                         wating_vote_result = true;
-                    }
-                    if wating_vote_result {
+                    } else if wating_vote_result {
                         if let Ok(result) = teller_rx.try_recv() {
                             if result {
                                 server_state = ServerStates::Leader;
@@ -550,34 +555,41 @@ impl Raft {
                         clock = 0;
                         append_entries_rx = rx;
                         wating_append_result = true;
-                    }
-                    if wating_append_result {
+                    } else if wating_append_result {
                         if let Ok(result) = append_entries_rx.try_recv() {
                             info!("{} received result: {}", self.me, result);
                             if result {
                                 let log = self.get_log();
                                 let mut have_new_commit = false;
-                                // commit command(s) into apply_ch here
-                                for command_index in self.state.commit_index.load(Ordering::Relaxed)
-                                    ..self.state.last_applied.load(Ordering::Relaxed)
+                                // commit command(s) into apply_ch here if log in this term is
+                                // existing in majority peers
+                                if self.get_log_term_by_index(
+                                    self.state.last_applied.load(Ordering::Relaxed),
+                                ) == self.get_term()
                                 {
-                                    have_new_commit = true;
-                                    let command = log[command_index as usize].0.clone();
-                                    info!(
-                                        "leader {} will commit {:?} with index {}",
-                                        self.me,
-                                        command,
-                                        command_index + 1
-                                    );
-                                    self.apply_ch
-                                        .unbounded_send(ApplyMsg {
-                                            command_valid: true,
+                                    for command_index in
+                                        self.state.commit_index.load(Ordering::Relaxed)
+                                            ..self.state.last_applied.load(Ordering::Relaxed)
+                                    {
+                                        have_new_commit = true;
+                                        let command = log[command_index as usize].0.clone();
+                                        info!(
+                                            "leader {} will commit {:?} with index {}",
+                                            self.me,
                                             command,
-                                            command_index: command_index + 1,
-                                        })
-                                        .unwrap();
-                                    self.state.increase_commit_index();
+                                            command_index + 1
+                                        );
+                                        self.apply_ch
+                                            .unbounded_send(ApplyMsg {
+                                                command_valid: true,
+                                                command,
+                                                command_index: command_index + 1,
+                                            })
+                                            .unwrap();
+                                        self.state.increase_commit_index();
+                                    }
                                 }
+
                                 if have_new_commit {
                                     self.persist();
                                 }
@@ -715,7 +727,8 @@ impl Raft {
             // return error to let leader decrease "next_index"
             let prev_log_term = self.get_log_term_by_index(args.prev_log_index);
             info!(
-                "arg.prev_index: {}, term: {}, self.prev_index: {}, term: {}",
+                "{} : arg.prev_index: {}, term: {}, self.prev_index: {}, term: {}",
+                self.me,
                 args.prev_log_index,
                 args.prev_log_term,
                 self.state.last_applied.load(Ordering::Relaxed),
@@ -750,23 +763,26 @@ impl Raft {
             let log = self.get_log();
             let leader_commit = args.leader_commit;
             let mut have_new_log = false;
-            for log_index in self.state.commit_index.load(Ordering::Relaxed)..leader_commit {
-                have_new_log = true;
-                info!(
-                    "follower {} will commit {:?} with index {}",
-                    self.me,
-                    log[log_index as usize],
-                    log_index + 1,
-                );
-                self.apply_ch
-                    .unbounded_send(ApplyMsg {
-                        command_valid: true,
-                        command: log[log_index as usize].0.clone(),
-                        command_index: log_index + 1,
-                    })
-                    .unwrap();
-                self.state.increase_commit_index();
+            if self.get_log_term_by_index(leader_commit) == self.get_term() {
+                for log_index in self.state.commit_index.load(Ordering::Relaxed)..leader_commit {
+                    have_new_log = true;
+                    info!(
+                        "follower {} will commit {:?} with index {}",
+                        self.me,
+                        log[log_index as usize],
+                        log_index + 1,
+                    );
+                    self.apply_ch
+                        .unbounded_send(ApplyMsg {
+                            command_valid: true,
+                            command: log[log_index as usize].0.clone(),
+                            command_index: log_index + 1,
+                        })
+                        .unwrap();
+                    self.state.increase_commit_index();
+                }
             }
+
             if have_new_log {
                 self.persist();
             }
@@ -1000,17 +1016,17 @@ impl RaftService for Node {
         let raft = self.raft.clone();
 
         let (term, success) = raft.append_entries(args);
-        if term > 0 {
-            raft.tx.send(IncomingRpcType::AppendEntries).unwrap();
-            Box::new(futures::future::result(Ok(AppendEntriesReply {
-                term,
-                success,
-            })))
-        } else {
-            Box::new(futures::future::result(Ok(AppendEntriesReply {
-                term: 0,
-                success,
-            })))
-        }
+        // if success {
+        raft.tx.send(IncomingRpcType::AppendEntries).unwrap();
+        Box::new(futures::future::result(Ok(AppendEntriesReply {
+            term,
+            success,
+        })))
+        // } else {
+        //     Box::new(futures::future::result(Ok(AppendEntriesReply {
+        //         term: 0,
+        //         success,
+        //     })))
+        // }
     }
 }
