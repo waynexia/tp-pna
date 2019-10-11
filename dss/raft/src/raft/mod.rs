@@ -98,22 +98,6 @@ impl State {
         );
     }
 
-    pub fn adjust_next_index(&self, feedback: Vec<(usize, bool)>) {
-        for (index, accept) in feedback {
-            let mut next_index = self.next_index.lock().unwrap();
-            if accept {
-                next_index[index] = self.commit_index.load(Ordering::Relaxed);
-            } else {
-                next_index[index] = if next_index[index] > 0 {
-                    next_index[index] - 1
-                } else {
-                    0
-                };
-            }
-            drop(next_index);
-        }
-    }
-
     pub fn new(num_peers: usize) -> State {
         let mut next_index = Vec::with_capacity(num_peers);
         for _ in 0..num_peers {
@@ -483,7 +467,7 @@ impl Raft {
 
                         // adjust last_applied based on reply from last AppendEntriesRpc
                         if let Ok(feedback) = append_entries_reply_rx.try_recv() {
-                            self.state.adjust_next_index(feedback);
+                            self.adjust_next_index(feedback);
                         }
                         let next_index = self.state.get_next_index();
                         let mut follower_tx = vec![];
@@ -627,6 +611,35 @@ impl Raft {
             log[index as usize - 1].1
         } else {
             0
+        }
+    }
+
+    fn adjust_next_index(&self, feedback: Vec<(usize, bool)>) {
+        for (index, accept) in feedback {
+            let mut next_index = self.state.next_index.lock().unwrap();
+            if accept {
+                next_index[index] = self.state.commit_index.load(Ordering::Relaxed);
+            } else {
+                let mut this_term = self.get_log_term_by_index(next_index[index]);
+                let mut prev_term_index = next_index[index];
+                // reach last log of prev term
+                while prev_term_index > 0
+                    && self.get_log_term_by_index(prev_term_index) == this_term
+                {
+                    prev_term_index -= 1;
+                }
+                this_term = self.get_log_term_by_index(prev_term_index);
+                // get to the first log in this term
+                while prev_term_index > 0
+                    && self.get_log_term_by_index(prev_term_index - 1) == this_term
+                {
+                    // if prev_term_index > 1 && self.get_log_term_by_index(prev_term_index - 1) == this_term{
+                    prev_term_index -= 1;
+                    // }
+                }
+                next_index[index] = prev_term_index;
+            }
+            drop(next_index);
         }
     }
 
