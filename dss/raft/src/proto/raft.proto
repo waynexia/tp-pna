@@ -24,7 +24,8 @@ message AppendEntriesArgs {
     uint64 prevLogIndex = 3;
     uint64 prevLogTerm = 4;
     repeated bytes entries = 5;
-    uint64 leaderCommit = 6;
+    repeated uint64 entries_term = 6;
+    uint64 leaderCommit = 7;
 }
 
 message AppendEntriesReply {
