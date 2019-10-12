@@ -2,6 +2,7 @@ use std::{error, fmt, result};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
+    Rpc(labrpc::Error),
     NoLeader,
 }
 
@@ -15,6 +16,7 @@ impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match *self {
             Error::NoLeader => None,
+            Error::Rpc(ref e) => Some(e),
         }
     }
 }

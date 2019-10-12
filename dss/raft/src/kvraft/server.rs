@@ -1,15 +1,28 @@
 use crate::proto::kvraftpb::*;
-use crate::raft;
+use crate::raft::{self};
 
+use crossbeam::channel::{unbounded as Cunbounded, Receiver as CReceiver};
 use futures::sync::mpsc::unbounded;
+use futures::sync::oneshot;
+use futures::{Future, Stream};
 use labrpc::RpcFuture;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::thread;
+// use std::sync::mpsc::UnboundedReceiver;
+
+use super::errors::*;
 
 pub struct KvServer {
     pub rf: raft::Node,
     me: usize,
     // snapshot if log grows this big
     maxraftstate: Option<usize>,
+    _state_machine: Arc<Mutex<HashMap<String, String>>>,
     // Your definitions here.
+    // apply_ch: Arc<UnboundedReceiver<ApplyMsg>>,
+    // committed_tx: CSender<Command>,
+    committed_rx: CReceiver<ApplyResult>,
 }
 
 impl KvServer {
@@ -22,9 +35,178 @@ impl KvServer {
         // You may need initialization code here.
 
         let (tx, apply_ch) = unbounded();
-        let rf = raft::Raft::new(servers, me, persister, tx);
+        let (committed_tx, committed_rx) = Cunbounded();
+        let raft = raft::Raft::new(servers, me, persister, tx);
+        let node = raft::Node::new(raft);
 
-        crate::your_code_here((rf, maxraftstate, apply_ch))
+        let state_machine = Arc::new(Mutex::new(HashMap::new()));
+        let s = state_machine.clone();
+
+        // receive committed command and apply it
+        // let notifier = committed_tx.clone();
+        let mut apply = apply_ch
+            .for_each(move |cmd| {
+                let sth_s = s.lock().unwrap();
+                drop(sth_s);
+                if !cmd.command_valid {
+                    return Ok(());
+                }
+                match labcodec::decode::<Command>(&cmd.command) {
+                    Ok(command) => {
+                        // lock and access HasmMap
+                        let mut storage = s.lock().unwrap();
+                        match command.command_type {
+                            // Put
+                            1 => {
+                                let key = command.key.clone();
+                                let value = command.value.clone().unwrap();
+                                storage.remove(&key);
+                                storage.insert(key, value);
+
+                                committed_tx
+                                    .send(ApplyResult {
+                                        command_type: 1,
+                                        success: true,
+                                        err: None,
+                                        value: None,
+                                    })
+                                    .unwrap();
+                            }
+                            // Append
+                            2 => {
+                                let key = command.key.clone();
+                                let value = command.value.clone().unwrap();
+                                let prev_value =
+                                    storage.get(&key).map(|s| s.to_owned()).unwrap_or_default();
+                                let new_value = format!("{}{}", prev_value, value);
+                                storage.insert(key, new_value);
+
+                                committed_tx
+                                    .send(ApplyResult {
+                                        command_type: 2,
+                                        success: true,
+                                        err: None,
+                                        value: None,
+                                    })
+                                    .unwrap();
+                            }
+                            // Get
+                            3 => {
+                                let key = command.key.clone();
+                                if !storage.contains_key(&key) {
+                                    committed_tx
+                                        .send(ApplyResult {
+                                            command_type: 3,
+                                            success: false,
+                                            err: Some("key does not exist".to_owned()),
+                                            value: Some("".to_owned()),
+                                        })
+                                        .unwrap();
+                                } else {
+                                    let value = storage.get(&key).unwrap().to_owned();
+                                    committed_tx
+                                        .send(ApplyResult {
+                                            command_type: 3,
+                                            success: true,
+                                            err: None,
+                                            value: Some(value),
+                                        })
+                                        .unwrap();
+                                }
+                            }
+                            _ => unreachable!(),
+                        }
+
+                        // notify
+                        // committed_tx.send(command).unwrap();
+                    }
+                    Err(e) => {
+                        debug!("decode error : {:?}", e);
+                    }
+                }
+                Ok(())
+            })
+            .map_err(move |_| debug!("some error"));
+        // is this right?
+        thread::spawn(move || loop {
+            apply.poll().unwrap();
+        });
+
+        KvServer {
+            rf: node,
+            me,
+            maxraftstate,
+            _state_machine: state_machine,
+            // committed_tx,
+            committed_rx,
+            // apply_ch,
+        }
+
+        // crate::your_code_here((rf, maxraftstate, apply_ch))
+    }
+
+    // start raft, listen on apply_ch and apply committed command
+    // need a new thread or function?
+    //
+    // background thread, to apply commands
+    // pub fn start1(&self){
+    // }
+
+    pub fn get_state(&self) -> Arc<raft::State> {
+        self.rf.get_state()
+    }
+
+    // just try to start a new command to raft
+    pub fn start<M>(&self, command: &M) -> Result<()>
+    where
+        M: labcodec::Message,
+    {
+        match self.rf.start(command) {
+            Ok((_, _)) => Ok(()),
+            Err(_) => Err(Error::NoLeader),
+        }
+    }
+
+    pub fn try_get(&self, args: &Command) -> GetReply {
+        // this lead is not a leader
+        if self.start(args).is_err() {
+            return GetReply {
+                wrong_leader: true,
+                err: "not leader".to_owned(),
+                value: "".to_owned(),
+            };
+        }
+
+        while let Ok(result) = self.committed_rx.try_recv() {
+            // timeout
+            // need to do re-send there?
+
+            // do command
+            // command is done in background thread.
+
+            // return value
+            if result.success {
+                let value = result.value.unwrap();
+                return GetReply {
+                    wrong_leader: false,
+                    err: "".to_owned(),
+                    value,
+                };
+            }
+        }
+
+        GetReply {
+            wrong_leader: false,
+            err: "foo".to_owned(),
+            value: "foo".to_owned(),
+        }
+    }
+
+    pub fn try_put_append(&self, _args: &Command) -> PutAppendReply{
+        PutAppendReply{
+            wrong_leader: false,
+            err: "foo".to_owned(),
+        }
     }
 }
 
@@ -54,12 +236,16 @@ impl KvServer {
 #[derive(Clone)]
 pub struct Node {
     // Your definitions here.
+    server: Arc<KvServer>,
 }
 
 impl Node {
     pub fn new(kv: KvServer) -> Node {
         // Your code here.
-        crate::your_code_here(kv);
+        // crate::your_code_here(kv);
+        Node {
+            server: Arc::new(kv),
+        }
     }
 
     /// the tester calls Kill() when a KVServer instance won't
@@ -80,24 +266,49 @@ impl Node {
         self.get_state().is_leader()
     }
 
-    pub fn get_state(&self) -> raft::State {
+    pub fn get_state(&self) -> Arc<raft::State> {
         // Your code here.
-        raft::State {
-            ..Default::default()
-        }
+        // raft::State {
+        //     ..Default::default()
+        // }
+        self.server.get_state()
     }
 }
 
 impl KvService for Node {
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
-    fn get(&self, arg: GetRequest) -> RpcFuture<GetReply> {
+    fn get(&self, args: GetRequest) -> RpcFuture<GetReply> {
         // Your code here.
-        crate::your_code_here(arg)
+        let command = Command {
+            command_type: 3, // Get
+            key: args.key,
+            value: None,
+        };
+        let (tx, rx) = oneshot::channel::<GetReply>();
+
+        let server = self.server.clone();
+        thread::spawn(move || tx.send(server.try_get(&command)));
+
+        let retval = rx.wait().unwrap_or_default();
+        Box::new(futures::future::result(Ok(retval)))
     }
 
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
-    fn put_append(&self, arg: PutAppendRequest) -> RpcFuture<PutAppendReply> {
+    fn put_append(&self, args: PutAppendRequest) -> RpcFuture<PutAppendReply> {
         // Your code here.
-        crate::your_code_here(arg)
+        // crate::your_code_here(arg)
+
+        let command = Command {
+            command_type: args.op,
+            key: args.key,
+            value: Some(args.value),
+        };
+        let (tx, rx) = oneshot::channel::<PutAppendReply>();
+
+        let server = self.server.clone();
+        thread::spawn(move || tx.send(server.try_put_append(&command)));
+
+        let retval = rx.wait().unwrap_or_default();
+        Box::new(futures::future::result(Ok(retval)))
     }
 }

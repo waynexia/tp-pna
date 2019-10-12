@@ -232,7 +232,7 @@ impl Raft {
         labcodec::encode(&presistent_state, &mut data).unwrap();
         self.persister.lock().unwrap().save_raft_state(data);
 
-        info!("{} presisted!", self.me);
+        debug!("{} presisted!", self.me);
     }
 
     /// restore previously persisted state.
@@ -243,7 +243,7 @@ impl Raft {
         }
         match labcodec::decode::<PresistentState>(data) {
             Ok(presistent_state) => {
-                info!("data for restoring {} : {:?}", self.me, presistent_state);
+                debug!("data for restoring {} : {:?}", self.me, presistent_state);
                 self.state
                     .current_term
                     .store(presistent_state.current_term, Ordering::Relaxed);
@@ -267,7 +267,7 @@ impl Raft {
                 self.state
                     .last_applied
                     .store(log.len() as u64, Ordering::Relaxed);
-                info!("recovered state of peer {} : {:?}", self.me, self.state);
+                debug!("recovered state of peer {} : {:?}", self.me, self.state);
             }
             Err(e) => {
                 panic!("{:?}", e);
@@ -344,7 +344,7 @@ impl Raft {
         labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
         let mut log = self.state.log.lock().unwrap();
         let index = log.len() + 1;
-        info!(
+        debug!(
             "{}, term: {}, buf : {:?}, command: {:?}",
             self.me,
             self.get_term(),
@@ -557,7 +557,7 @@ impl Raft {
                         wating_append_result = true;
                     } else if wating_append_result {
                         if let Ok(result) = append_entries_rx.try_recv() {
-                            info!("{} received result: {}", self.me, result);
+                            debug!("{} received result: {}", self.me, result);
                             if result {
                                 let log = self.get_log();
                                 let mut have_new_commit = false;
@@ -573,7 +573,7 @@ impl Raft {
                                     {
                                         have_new_commit = true;
                                         let command = log[command_index as usize].0.clone();
-                                        info!(
+                                        debug!(
                                             "leader {} will commit {:?} with index {}",
                                             self.me,
                                             command,
@@ -674,7 +674,7 @@ impl Raft {
         let is_up_to_date = self_last_log_term < last_log_term // up to date
                     || (self_last_log_term == last_log_term
                         && self.state.last_applied.load(Ordering::Relaxed) <= last_log_index);
-        info!("self: {} (voted for:{:?}) received a vote request, candidate is {}, last log index is {}, own is {}  term is {}, own is {}, last log term is {}, its own is {}, up to date: {}",
+        debug!("self: {} (voted for:{:?}) received a vote request, candidate is {}, last log index is {}, own is {}  term is {}, own is {}, last log term is {}, its own is {}, up to date: {}",
             self.me,
             voted_for,candidate_id,
             last_log_index,
@@ -696,10 +696,10 @@ impl Raft {
             }
             self.state.current_term.store(term, Ordering::Relaxed);
 
-            info!("{}\tgrant", self.me);
+            debug!("{}\tgrant", self.me);
             return true;
         }
-        info!("{}\tnot grant", self.me);
+        debug!("{}\tnot grant", self.me);
         self.state.current_term.store(term, Ordering::Relaxed);
         false
     }
@@ -710,7 +710,7 @@ impl Raft {
         // if is really leader, will not run into this function
         // leader should call apply_ch in state machine
 
-        info!(
+        debug!(
             "No. {} (last applied: {}, term: {}) received {:?}",
             self.me,
             self.state.last_applied.load(Ordering::Relaxed),
@@ -726,7 +726,7 @@ impl Raft {
 
             // return error to let leader decrease "next_index"
             let prev_log_term = self.get_log_term_by_index(args.prev_log_index);
-            info!(
+            debug!(
                 "{} : arg.prev_index: {}, term: {}, self.prev_index: {}, term: {}",
                 self.me,
                 args.prev_log_index,
@@ -737,7 +737,7 @@ impl Raft {
             if args.prev_log_index > self.state.last_applied.load(Ordering::Relaxed)
                 || (args.prev_log_term != prev_log_term && prev_log_term != 0)
             {
-                info!("reject append entries rpc");
+                debug!("reject append entries rpc");
                 return (self.state.term(), false);
             }
             // overwrite its own log with leader's
@@ -766,7 +766,7 @@ impl Raft {
             if self.get_log_term_by_index(leader_commit) == self.get_term() {
                 for log_index in self.state.commit_index.load(Ordering::Relaxed)..leader_commit {
                     have_new_log = true;
-                    info!(
+                    debug!(
                         "follower {} will commit {:?} with index {}",
                         self.me,
                         log[log_index as usize],
@@ -812,7 +812,7 @@ impl Raft {
                         if append_entries_reply.term
                             > leader_term.load(Ordering::Relaxed)
                         {
-                            info!("leader received a append reply with term {}, which is greater than {}",append_entries_reply.term,leader_term.load(Ordering::Relaxed));
+                            debug!("leader received a append reply with term {}, which is greater than {}",append_entries_reply.term,leader_term.load(Ordering::Relaxed));
                             leader_term.store(
                                 append_entries_reply.term,
                                 Ordering::Relaxed,
@@ -870,7 +870,7 @@ impl Raft {
             } else if signal == IncomingRpcType::TurnToFollower {
                 // need to judge term
                 *server_state = ServerStates::Follower;
-                info!(
+                debug!(
                     "leader {}, term: {} will turn to follower",
                     self.me,
                     self.get_term()
@@ -883,20 +883,6 @@ impl Raft {
             // and IncomingRpcType::AppendEntries
             *clock = 0;
         }
-    }
-}
-
-impl Raft {
-    /// Only for suppressing deadcode warnings.
-    #[doc(hidden)]
-    pub fn __suppress_deadcode(&mut self) {
-        let _ = self.start(&0);
-        let _ = self.send_request_vote(0, &Default::default());
-        self.persist();
-        let _ = &self.state;
-        let _ = &self.me;
-        // let _ = &self.persister;
-        let _ = &self.peers;
     }
 }
 
@@ -1016,17 +1002,10 @@ impl RaftService for Node {
         let raft = self.raft.clone();
 
         let (term, success) = raft.append_entries(args);
-        // if success {
         raft.tx.send(IncomingRpcType::AppendEntries).unwrap();
         Box::new(futures::future::result(Ok(AppendEntriesReply {
             term,
             success,
         })))
-        // } else {
-        //     Box::new(futures::future::result(Ok(AppendEntriesReply {
-        //         term: 0,
-        //         success,
-        //     })))
-        // }
     }
 }
