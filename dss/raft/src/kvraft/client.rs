@@ -1,6 +1,8 @@
 use rand::Rng;
 use std::fmt;
 use std::sync::mpsc::{channel, Receiver};
+use std::thread;
+use std::time::Duration;
 
 use crate::proto::kvraftpb::*;
 use futures::Future;
@@ -35,7 +37,6 @@ impl Clerk {
             servers,
             num_server,
         }
-        // crate::your_code_here((name, servers))
     }
 
     /// fetch the current value for a key.
@@ -45,23 +46,29 @@ impl Clerk {
     // you can send an RPC with code like this:
     // let reply = self.servers[i].get(args).unwrap();
     pub fn get(&self, key: String) -> String {
-        // You will have to modify this function.
-        // crate::your_code_here(key)
-
         let mut rng = rand::thread_rng();
-
-        // random choose a server to send command
-        let server_index = rng.gen_range(0, self.num_server);
         let request = GetRequest { key };
-        let rx = self.send_get_rpc(server_index, &request);
 
-        while let Ok(result) = rx.try_recv() {
-            if let Ok(get_reply) = result {
-                return get_reply.value;
+        loop {
+            // random choose a server to send command
+            let server_index = rng.gen_range(0, self.num_server);
+            let rx = self.send_get_rpc(server_index, &request);
+
+            loop {
+                if let Ok(result) = rx.try_recv() {
+                    if let Ok(get_reply) = result {
+                        if get_reply.wrong_leader {
+                            // this one is not leader, break and roll a new one
+                            break;
+                        }
+                        info!("result: {}", get_reply.value);
+
+                        return get_reply.value;
+                    }
+                }
             }
+            thread::sleep(Duration::from_millis(500));
         }
-
-        "".to_owned()
     }
 
     /// shared by Put and Append.
@@ -72,22 +79,31 @@ impl Clerk {
         // You will have to modify this function.
 
         let mut rng = rand::thread_rng();
-        let server_index = rng.gen_range(0, self.num_server);
         let (key, value, op) = match op {
             Op::Put(key, value) => (key, value, 1),
             Op::Append(key, value) => (key, value, 2),
         };
         let request = PutAppendRequest { key, value, op };
+        loop {
+            // random choose a server to send command
+            let server_index = rng.gen_range(0, self.num_server);
+            let rx = self.send_put_append_rpc(server_index, &request);
 
-        let rx = self.send_put_append_rpc(server_index, &request);
+            loop {
+                if let Ok(result) = rx.try_recv() {
+                    if let Ok(put_append_reply) = result {
+                        if put_append_reply.wrong_leader {
+                            // this one is not leader, break and roll a new one
+                            break;
+                        }
+                        info!("result: done {:?}", put_append_reply);
 
-        while let Ok(result) = rx.try_recv() {
-            if let Ok(_get_reply) = result {
-                // return get_reply.value;
+                        return;
+                    }
+                }
             }
+            thread::sleep(Duration::from_millis(500));
         }
-
-        // "".to_owned()
     }
 
     pub fn put(&self, key: String, value: String) {

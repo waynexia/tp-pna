@@ -9,7 +9,10 @@ use labrpc::RpcFuture;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
-// use std::sync::mpsc::UnboundedReceiver;
+// use tokio;
+// use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+// use tokio::prelude::*;
+use tokio::runtime::Runtime;
 
 use super::errors::*;
 
@@ -23,6 +26,7 @@ pub struct KvServer {
     // apply_ch: Arc<UnboundedReceiver<ApplyMsg>>,
     // committed_tx: CSender<Command>,
     committed_rx: CReceiver<ApplyResult>,
+    _rt: Runtime,
 }
 
 impl KvServer {
@@ -35,6 +39,7 @@ impl KvServer {
         // You may need initialization code here.
 
         let (tx, apply_ch) = unbounded();
+        // let (tx, apply_ch) = unbounded_channel();
         let (committed_tx, committed_rx) = Cunbounded();
         let raft = raft::Raft::new(servers, me, persister, tx);
         let node = raft::Node::new(raft);
@@ -42,9 +47,7 @@ impl KvServer {
         let state_machine = Arc::new(Mutex::new(HashMap::new()));
         let s = state_machine.clone();
 
-        // receive committed command and apply it
-        // let notifier = committed_tx.clone();
-        let mut apply = apply_ch
+        let apply = apply_ch
             .for_each(move |cmd| {
                 let sth_s = s.lock().unwrap();
                 drop(sth_s);
@@ -97,7 +100,7 @@ impl KvServer {
                                     committed_tx
                                         .send(ApplyResult {
                                             command_type: 3,
-                                            success: false,
+                                            success: true,
                                             err: Some("key does not exist".to_owned()),
                                             value: Some("".to_owned()),
                                         })
@@ -116,9 +119,6 @@ impl KvServer {
                             }
                             _ => unreachable!(),
                         }
-
-                        // notify
-                        // committed_tx.send(command).unwrap();
                     }
                     Err(e) => {
                         debug!("decode error : {:?}", e);
@@ -127,10 +127,11 @@ impl KvServer {
                 Ok(())
             })
             .map_err(move |_| debug!("some error"));
-        // is this right?
-        thread::spawn(move || loop {
-            apply.poll().unwrap();
-        });
+        // thread::spawn(move || {
+        //     let _ = apply.wait();
+        // });
+        let rt = Runtime::new().unwrap();
+        rt.executor().spawn(apply);
 
         KvServer {
             rf: node,
@@ -140,9 +141,8 @@ impl KvServer {
             // committed_tx,
             committed_rx,
             // apply_ch,
+            _rt: rt,
         }
-
-        // crate::your_code_here((rf, maxraftstate, apply_ch))
     }
 
     // start raft, listen on apply_ch and apply committed command
@@ -163,49 +163,72 @@ impl KvServer {
     {
         match self.rf.start(command) {
             Ok((_, _)) => Ok(()),
-            Err(_) => Err(Error::NoLeader),
+            Err(e) => {
+                info!("{:?}", e);
+                Err(Error::NoLeader)
+            }
         }
     }
 
     pub fn try_get(&self, args: &Command) -> GetReply {
         // this lead is not a leader
+        // info!("will submit a get request to {}", self.me);
         if self.start(args).is_err() {
+            // info!("not leader");
             return GetReply {
                 wrong_leader: true,
                 err: "not leader".to_owned(),
                 value: "".to_owned(),
             };
         }
+        info!("is leader");
 
-        while let Ok(result) = self.committed_rx.try_recv() {
-            // timeout
-            // need to do re-send there?
+        loop {
+            if let Ok(result) = self.committed_rx.try_recv() {
+                // timeout
+                // need to do re-send there?
 
-            // do command
-            // command is done in background thread.
+                // do command
+                // command is done in background thread.
 
-            // return value
-            if result.success {
-                let value = result.value.unwrap();
-                return GetReply {
-                    wrong_leader: false,
-                    err: "".to_owned(),
-                    value,
-                };
+                // return value
+                if result.success {
+                    let value = result.value.unwrap();
+                    return GetReply {
+                        wrong_leader: false,
+                        err: "".to_owned(),
+                        value,
+                    };
+                }
             }
-        }
-
-        GetReply {
-            wrong_leader: false,
-            err: "foo".to_owned(),
-            value: "foo".to_owned(),
         }
     }
 
-    pub fn try_put_append(&self, _args: &Command) -> PutAppendReply{
-        PutAppendReply{
-            wrong_leader: false,
-            err: "foo".to_owned(),
+    pub fn try_put_append(&self, args: &Command) -> PutAppendReply {
+        if self.start(args).is_err() {
+            // info!("not leader");
+            return PutAppendReply {
+                wrong_leader: true,
+                err: "not leader".to_owned(),
+            };
+        }
+
+        loop {
+            if let Ok(result) = self.committed_rx.try_recv() {
+                // timeout
+                // need to do re-send there?
+
+                // do command
+                // command is done in background thread.
+
+                // return value
+                if result.success {
+                    return PutAppendReply {
+                        wrong_leader: false,
+                        err: "not leader".to_owned(),
+                    };
+                }
+            }
         }
     }
 }
@@ -278,7 +301,6 @@ impl Node {
 impl KvService for Node {
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     fn get(&self, args: GetRequest) -> RpcFuture<GetReply> {
-        // Your code here.
         let command = Command {
             command_type: 3, // Get
             key: args.key,
@@ -295,9 +317,6 @@ impl KvService for Node {
 
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     fn put_append(&self, args: PutAppendRequest) -> RpcFuture<PutAppendReply> {
-        // Your code here.
-        // crate::your_code_here(arg)
-
         let command = Command {
             command_type: args.op,
             key: args.key,
