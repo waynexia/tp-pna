@@ -46,6 +46,10 @@ pub mod kvraftpb {
         pub key: String,
         #[prost(optional, string, tag = "3")]
         pub value: Option<String>,
+        #[prost(uint64, tag = "4")]
+        pub token: u64,
+        #[prost(uint64, tag = "5")]
+        pub resend: u64,
     }
 
     #[derive(Clone, PartialEq, Message)]
@@ -54,6 +58,8 @@ pub mod kvraftpb {
         pub command_type: i32,
         #[prost(bool, tag = "2")]
         pub success: bool,
+        #[prost(uint64, tag = "5")]
+        pub token: u64,
         #[prost(optional, string, tag = "3")]
         pub err: Option<String>,
         #[prost(optional, string, tag = "4")]

@@ -1,8 +1,8 @@
 use rand::Rng;
 use std::fmt;
 use std::sync::mpsc::{channel, Receiver};
-use std::thread;
-use std::time::Duration;
+// use std::thread;
+// use std::time::Duration;
 
 use crate::proto::kvraftpb::*;
 use futures::Future;
@@ -48,26 +48,25 @@ impl Clerk {
     pub fn get(&self, key: String) -> String {
         let mut rng = rand::thread_rng();
         let request = GetRequest { key };
+        info!("{:?}", request);
 
         loop {
             // random choose a server to send command
             let server_index = rng.gen_range(0, self.num_server);
             let rx = self.send_get_rpc(server_index, &request);
 
-            loop {
-                if let Ok(result) = rx.try_recv() {
-                    if let Ok(get_reply) = result {
-                        if get_reply.wrong_leader {
-                            // this one is not leader, break and roll a new one
-                            break;
-                        }
-                        info!("result: {}", get_reply.value);
-
-                        return get_reply.value;
+            if let Ok(result) = rx.recv() {
+                if let Ok(get_reply) = result {
+                    if get_reply.wrong_leader {
+                        // this one is not leader, break and roll a new one
+                        continue;
                     }
+                    info!("client result: `{}`", get_reply.value);
+
+                    return get_reply.value;
                 }
             }
-            thread::sleep(Duration::from_millis(500));
+            // thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -84,25 +83,24 @@ impl Clerk {
             Op::Append(key, value) => (key, value, 2),
         };
         let request = PutAppendRequest { key, value, op };
+        info!("{:?}", request);
         loop {
             // random choose a server to send command
             let server_index = rng.gen_range(0, self.num_server);
             let rx = self.send_put_append_rpc(server_index, &request);
 
-            loop {
-                if let Ok(result) = rx.try_recv() {
-                    if let Ok(put_append_reply) = result {
-                        if put_append_reply.wrong_leader {
-                            // this one is not leader, break and roll a new one
-                            break;
-                        }
-                        info!("result: done {:?}", put_append_reply);
-
-                        return;
+            if let Ok(result) = rx.recv() {
+                if let Ok(put_append_reply) = result {
+                    if put_append_reply.wrong_leader {
+                        // this one is not leader, break and roll a new one
+                        continue;
                     }
+                    info!("client result: done {:?}", put_append_reply);
+
+                    return;
                 }
             }
-            thread::sleep(Duration::from_millis(500));
+            // thread::sleep(Duration::from_millis(500));
         }
     }
 
