@@ -20,8 +20,8 @@ pub mod kvraftpb {
 
     labrpc::service! {
         service kv {
-            rpc get(GetRequest) returns (GetReply);
-            rpc put_append(PutAppendRequest) returns (PutAppendReply);
+            rpc get(GetRequest) returns (ApplyResult);
+            rpc put_append(PutAppendRequest) returns (ApplyResult);
 
             // Your code here if more rpc desired.
             // rpc xxx(yyy) returns (zzz)
@@ -48,8 +48,6 @@ pub mod kvraftpb {
         pub value: Option<String>,
         #[prost(uint64, tag = "4")]
         pub token: u64,
-        #[prost(uint64, tag = "5")]
-        pub resend: u64,
     }
 
     #[derive(Clone, PartialEq, Message)]
@@ -58,8 +56,8 @@ pub mod kvraftpb {
         pub command_type: i32,
         #[prost(bool, tag = "2")]
         pub success: bool,
-        #[prost(uint64, tag = "5")]
-        pub token: u64,
+        #[prost(bool, tag = "5")]
+        pub wrong_leader: bool,
         #[prost(optional, string, tag = "3")]
         pub err: Option<String>,
         #[prost(optional, string, tag = "4")]

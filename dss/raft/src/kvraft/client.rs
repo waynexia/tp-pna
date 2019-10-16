@@ -61,9 +61,10 @@ impl Clerk {
                         // this one is not leader, break and roll a new one
                         continue;
                     }
-                    info!("client result: `{}`", get_reply.value);
+                    let value = get_reply.value.unwrap();
+                    info!("client result: `{}`", value);
 
-                    return get_reply.value;
+                    return value;
                 }
             }
             // thread::sleep(Duration::from_millis(50));
@@ -115,7 +116,11 @@ impl Clerk {
 
 // private util functions
 impl Clerk {
-    fn send_get_rpc(&self, server_index: usize, args: &GetRequest) -> Receiver<Result<GetReply>> {
+    fn send_get_rpc(
+        &self,
+        server_index: usize,
+        args: &GetRequest,
+    ) -> Receiver<Result<ApplyResult>> {
         let server = &self.servers[server_index];
         let (tx, rx) = channel();
 
@@ -131,7 +136,7 @@ impl Clerk {
         &self,
         server_index: usize,
         args: &PutAppendRequest,
-    ) -> Receiver<Result<PutAppendReply>> {
+    ) -> Receiver<Result<ApplyResult>> {
         let server = &self.servers[server_index];
         let (tx, rx) = channel();
 

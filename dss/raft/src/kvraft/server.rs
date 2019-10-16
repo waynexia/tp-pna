@@ -1,14 +1,15 @@
 use crate::proto::kvraftpb::*;
 use crate::raft::{self};
 
-use crossbeam::channel::{unbounded as Cunbounded, Receiver as CReceiver, Sender as CSender};
+// use crossbeam::channel::{unbounded as Cunbounded, Receiver as CReceiver, Sender as CSender};
 use futures::sync::mpsc::unbounded;
 use futures::sync::oneshot;
+use futures::sync::oneshot::Sender as OSender;
 use futures::{Future, Stream};
 use labrpc::{Error as LError, RpcFuture};
 use rand::Rng;
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -25,13 +26,16 @@ pub struct KvServer {
     // snapshot if log grows this big
     maxraftstate: Option<usize>,
     _state_machine: Arc<Mutex<HashMap<String, String>>>,
-    _dup_cmd: Arc<Mutex<HashMap<u64, String>>>,
+    dup_cmd: Arc<Mutex<HashMap<u64, OSender<ApplyResult>>>>,
     // Your definitions here.
     // apply_ch: Arc<UnboundedReceiver<ApplyMsg>>,
-    committed_tx: CSender<ApplyResult>,
-    committed_rx: CReceiver<ApplyResult>,
+    // committed_tx: CSender<ApplyResult>,
+    // committed_rx: CReceiver<ApplyResult>,
     _rt: Runtime,
-    _token: Arc<AtomicU64>,
+    // token for received command
+    rcv_token: Arc<AtomicU64>,
+    // token for applied command
+    _apl_token: Arc<AtomicU64>,
 }
 
 impl KvServer {
@@ -45,16 +49,21 @@ impl KvServer {
 
         let (tx, apply_ch) = unbounded();
         // let (tx, apply_ch) = unbounded_channel();
-        let (committed_tx, committed_rx) = Cunbounded();
-        let raft = raft::Raft::new(servers, me, persister, tx);
+        // let (committed_tx, committed_rx) = Cunbounded();
+        let raft = raft::Raft::new(servers, me, persister, tx.clone());
         let node = raft::Node::new(raft);
 
         let state_machine = Arc::new(Mutex::new(HashMap::new()));
         let s = state_machine.clone();
-        let dup_cmd = Arc::new(Mutex::new(HashMap::new()));
+        let dup_cmd: Arc<Mutex<HashMap<u64, OSender<ApplyResult>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let apl_token = Arc::new(AtomicU64::new(0));
         let d = dup_cmd.clone();
 
-        let tx = committed_tx.clone();
+        // let tx = committed_tx.clone();
+        let re_apply_tx = tx.clone();
+        let apl_token_for_capture = apl_token.clone();
+        // let me_ = me.clone();
         let apply = apply_ch
             .for_each(move |cmd| {
                 // let sth_s = s.lock().unwrap();
@@ -65,6 +74,25 @@ impl KvServer {
                 match labcodec::decode::<Command>(&cmd.command) {
                     Ok(command) => {
                         // lock and access HasmMap
+                        let apply_token = apl_token_for_capture.load(Ordering::SeqCst);
+                        // a legal command but need to be applied later
+                        if command.token > apply_token + 1 {
+                            debug!(
+                                "me :{}, skiped apply token {}, send into re-apply",
+                                me, apply_token
+                            );
+                            re_apply_tx
+                                .unbounded_send(cmd)
+                                .expect("failed to re-send apply message");
+                            return Ok(());
+                        } else {
+                            debug!("me :{}, apply token {}", me, apply_token);
+                            apl_token_for_capture.store(
+                                apl_token_for_capture.load(Ordering::SeqCst) + 1,
+                                Ordering::SeqCst,
+                            );
+                        }
+
                         let mut storage = s.lock().unwrap();
                         let mut dup_cmd = d.lock().unwrap();
                         match command.command_type {
@@ -72,24 +100,17 @@ impl KvServer {
                             1 => {
                                 // this command is executed before
                                 if dup_cmd.contains_key(&command.token) {
-                                    // tx.send(ApplyResult {
-                                    //     command_type: 1,
-                                    //     success: true,
-                                    //     err: None,
-                                    //     value: None,
-                                    // })
-                                    // .unwrap();
-                                } else {
                                     let key = command.key.clone();
                                     let value = command.value.clone().unwrap();
+                                    let tx = dup_cmd.remove(&command.token).unwrap();
                                     storage.remove(&key);
                                     storage.insert(key, value);
-                                    dup_cmd.insert(command.token, "".to_owned());
+                                    // dup_cmd.insert(command.token, "".to_owned());
 
                                     tx.send(ApplyResult {
                                         command_type: 1,
                                         success: true,
-                                        token: command.token,
+                                        wrong_leader: false,
                                         err: None,
                                         value: None,
                                     })
@@ -98,19 +119,20 @@ impl KvServer {
                             }
                             // Append
                             2 => {
-                                if !dup_cmd.contains_key(&command.token) {
+                                if dup_cmd.contains_key(&command.token) {
                                     let key = command.key.clone();
                                     let value = command.value.clone().unwrap();
                                     let prev_value =
                                         storage.get(&key).map(|s| s.to_owned()).unwrap_or_default();
                                     let new_value = format!("{}{}", prev_value, value);
                                     storage.insert(key, new_value);
-                                    dup_cmd.insert(command.token, "".to_owned());
+                                    let tx = dup_cmd.remove(&command.token).unwrap();
+                                    // dup_cmd.insert(command.token, "".to_owned());
 
                                     tx.send(ApplyResult {
                                         command_type: 2,
                                         success: true,
-                                        token: command.token,
+                                        wrong_leader: false,
                                         err: None,
                                         value: None,
                                     })
@@ -119,25 +141,26 @@ impl KvServer {
                             }
                             // Get
                             3 => {
-                                if !dup_cmd.contains_key(&command.token) {
+                                if dup_cmd.contains_key(&command.token) {
                                     let key = command.key.clone();
+                                    let tx = dup_cmd.remove(&command.token).unwrap();
                                     if !storage.contains_key(&key) {
-                                        dup_cmd.insert(command.token, "".to_owned());
+                                        // dup_cmd.insert(command.token, "".to_owned());
                                         tx.send(ApplyResult {
                                             command_type: 3,
                                             success: true,
-                                            token: command.token,
+                                            wrong_leader: false,
                                             err: Some("key does not exist".to_owned()),
                                             value: Some("".to_owned()),
                                         })
                                         .unwrap();
                                     } else {
                                         let value = storage.get(&key).unwrap().to_owned();
-                                        dup_cmd.insert(command.token, value.clone());
+                                        // dup_cmd.insert(command.token, value.clone());
                                         tx.send(ApplyResult {
                                             command_type: 3,
                                             success: true,
-                                            token: command.token,
+                                            wrong_leader: false,
                                             err: None,
                                             value: Some(value),
                                         })
@@ -166,24 +189,24 @@ impl KvServer {
             me,
             maxraftstate,
             _state_machine: state_machine,
-            _dup_cmd: dup_cmd,
-            committed_tx,
-            committed_rx,
+            dup_cmd,
+            // committed_tx,
+            // committed_rx,
             // apply_ch,
             _rt: rt,
-            _token: Arc::new(AtomicU64::new(0)),
+            rcv_token: Arc::new(AtomicU64::new(0)),
+            _apl_token: apl_token,
         }
     }
 
-    // start raft, listen on apply_ch and apply committed command
-    // need a new thread or function?
-    //
-    // background thread, to apply commands
-    // pub fn start1(&self){
-    // }
-
     pub fn get_state(&self) -> Arc<raft::State> {
         self.rf.get_state()
+    }
+
+    fn get_rcv_token_and_increase(&self) -> u64 {
+        let retval = self.rcv_token.load(Ordering::SeqCst);
+        self.rcv_token.store(retval + 1, Ordering::SeqCst);
+        retval
     }
 
     // just try to start a new command to raft
@@ -191,94 +214,74 @@ impl KvServer {
     where
         M: labcodec::Message,
     {
-        println!("start a command");
+        info!("start a command");
         match self.rf.start(command) {
             Ok((_, _)) => Ok(()),
             Err(_) => Err(Error::NoLeader),
         }
     }
 
-    pub fn try_get(&self, mut args: Command) -> GetReply {
-        // this lead is not a leader
-        // info!("will submit a get request to {}", self.me);committed_rx
-        let mut resend_cnt = 0;
-        loop {
-            args.resend += 1;
+    pub fn try_get(&self, mut args: Command, tx: OSender<ApplyResult>) {
+        let token = self.get_rcv_token_and_increase();
+        args.token = token;
+        let mut dup_cmd = self.dup_cmd.lock().unwrap();
+        dup_cmd.insert(token, tx);
+        drop(dup_cmd);
+        for resend_cnt in 0..3 {
             if self.start(&args).is_err() || resend_cnt > 3 {
                 // info!("not leader");
-                return GetReply {
+                let mut dup_cmd = self.dup_cmd.lock().unwrap();
+                let tx = dup_cmd.remove(&token).unwrap();
+                let _ = tx.send(ApplyResult {
+                    command_type: args.command_type,
                     wrong_leader: true,
-                    err: "not leader".to_owned(),
-                    value: "".to_owned(),
-                };
-            }
-            info!("is leader");
-
-            if let Ok(result) = self.committed_rx.recv() {
-                if result.token != args.token {
-                    self.committed_tx
-                        .send(result)
-                        .expect("commit receiver is dropped");
-                    continue;
-                }
-                // timeout
-                // need to do re-send there?
-
-                // do command
-                // command is done in background thread.
-
-                // return value
-                info!("result: {:?}", result);
-                if result.success {
-                    let value = result.value.unwrap();
-                    return GetReply {
-                        wrong_leader: false,
-                        err: "".to_owned(),
-                        value,
-                    };
-                }
+                    success: false,
+                    err: Some("failed to reach consensuce".to_owned()),
+                    value: Some("".to_owned()),
+                });
+                return;
             }
             thread::sleep(Duration::from_millis(1000));
-            resend_cnt += 1;
+
+            // check if applied
+            let dup_cmd = self.dup_cmd.lock().unwrap();
+            if !dup_cmd.contains_key(&token) {
+                return;
+            }
+            drop(dup_cmd);
+
+            // resend_cnt += 1;
         }
     }
 
-    pub fn try_put_append(&self, mut args: Command) -> PutAppendReply {
-        let mut resend_cnt = 0;
-        loop {
-            args.resend += 1;
+    pub fn try_put_append(&self, mut args: Command, tx: OSender<ApplyResult>) {
+        let token = self.get_rcv_token_and_increase();
+        args.token = token;
+        let mut dup_cmd = self.dup_cmd.lock().unwrap();
+        dup_cmd.insert(token, tx);
+        drop(dup_cmd);
+        for resend_cnt in 0..3 {
             if self.start(&args).is_err() || resend_cnt > 3 {
                 // info!("not leader");
-                return PutAppendReply {
+                let mut dup_cmd = self.dup_cmd.lock().unwrap();
+                let tx = dup_cmd.remove(&token).unwrap();
+                let _ = tx.send(ApplyResult {
+                    command_type: args.command_type,
                     wrong_leader: true,
-                    err: "not leader".to_owned(),
-                };
-            }
-
-            if let Ok(result) = self.committed_rx.recv() {
-                if result.token != args.token {
-                    self.committed_tx
-                        .send(result)
-                        .expect("commit receiver is dropped");
-                    continue;
-                }
-                // timeout
-                // need to do re-send there?
-
-                // do command
-                // command is done in background thread.
-
-                // return value
-                info!("~~~~~~~~~~~~~~~~~~~~~~~~result: {:?}", result);
-                if result.success {
-                    return PutAppendReply {
-                        wrong_leader: false,
-                        err: "".to_owned(),
-                    };
-                }
+                    success: false,
+                    err: Some("failed to reach consensuce".to_owned()),
+                    value: Some("".to_owned()),
+                });
+                return;
             }
             thread::sleep(Duration::from_millis(1000));
-            resend_cnt += 1;
+
+            // check if applied
+            let dup_cmd = self.dup_cmd.lock().unwrap();
+            if !dup_cmd.contains_key(&token) {
+                return;
+            }
+            drop(dup_cmd);
         }
     }
 }
@@ -340,62 +343,48 @@ impl Node {
     }
 
     pub fn get_state(&self) -> Arc<raft::State> {
-        // Your code here.
-        // raft::State {
-        //     ..Default::default()
-        // }
         self.server.get_state()
     }
 }
 
 impl KvService for Node {
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
-    fn get(&self, args: GetRequest) -> RpcFuture<GetReply> {
+    fn get(&self, args: GetRequest) -> RpcFuture<ApplyResult> {
         if !self.is_leader() {
-            return Box::new(futures::future::result(Ok(GetReply {
+            return Box::new(futures::future::result(Ok(ApplyResult {
+                command_type: 3, //Get
                 wrong_leader: true,
-                err: "not leader".to_owned(),
-                value: "".to_owned(),
+                success: false,
+                err: Some("not leader".to_owned()),
+                value: Some("".to_owned()),
             })));
         }
-
-        let mut rng = rand::thread_rng();
-        let token: u64 = rng.gen();
-
-        println!("start a get");
+        info!("start a get");
 
         let command = Command {
             command_type: 3, // Get
             key: args.key,
             value: None,
-            token,
-            resend: 0,
+            token: 0,
         };
-        let (tx, rx) = oneshot::channel::<GetReply>();
-
-        // let mut rng = rand::thread_rng();
-        // let token: u16 = rng.gen();
-
-        // info!("going to wait {}", token);
-        let server = self.server.clone();
-        thread::spawn(move || tx.send(server.try_get(command)));
-
-        // let retval = rx.wait().unwrap_or_default();
-        // info!("wait finish {}", token);
-        // Box::new(futures::future::result(Ok(retval)))
+        let (tx, rx) = oneshot::channel::<ApplyResult>();
+        self.server.try_get(command, tx);
         Box::new(rx.map_err(LError::Recv))
     }
 
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
-    fn put_append(&self, args: PutAppendRequest) -> RpcFuture<PutAppendReply> {
+    fn put_append(&self, args: PutAppendRequest) -> RpcFuture<ApplyResult> {
         if !self.is_leader() {
-            return Box::new(futures::future::result(Ok(PutAppendReply {
+            return Box::new(futures::future::result(Ok(ApplyResult {
+                command_type: args.op,
                 wrong_leader: true,
-                err: "not leader".to_owned(),
+                success: false,
+                err: Some("not leader".to_owned()),
+                value: Some("".to_owned()),
             })));
         }
 
-        println!("start a put / append");
+        info!("start a put / append");
         let mut rng = rand::thread_rng();
         let token: u64 = rng.gen();
 
@@ -404,17 +393,9 @@ impl KvService for Node {
             key: args.key,
             value: Some(args.value),
             token,
-            resend: 0,
         };
-        let (tx, rx) = oneshot::channel::<PutAppendReply>();
-
-        // info!("going to wait {}", token);
-        let server = self.server.clone();
-        thread::spawn(move || tx.send(server.try_put_append(command)));
-
-        // let retval = rx.wait().unwrap_or_default();
-        // info!("wait finish {}", token);
-        // Box::new(futures::future::result(Ok(retval)))
+        let (tx, rx) = oneshot::channel::<ApplyResult>();
+        self.server.try_put_append(command, tx);
         Box::new(rx.map_err(LError::Recv))
     }
 }
