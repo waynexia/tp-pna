@@ -215,8 +215,9 @@ impl Raft {
         // seperate log into two vector for presisting
         let mut sep_log = vec![];
         let mut sep_term = vec![];
-        let commit_index = self.state.commit_index.load(Ordering::SeqCst) as usize;
-        let log = self.get_log()[..commit_index].to_vec();
+        // last_applied means the last entries that has been replied to leader.
+        let last_applied = self.state.last_applied.load(Ordering::SeqCst) as usize;
+        let log = self.get_log()[..last_applied].to_vec();
         for (l, t) in log {
             sep_log.push(l.clone());
             sep_term.push(t);
@@ -724,7 +725,6 @@ impl Raft {
                 .unwrap_or_default();
             self.state.current_term.store(args.term, Ordering::SeqCst);
 
-            // return error to let leader decrease "next_index"
             let prev_log_term = self.get_log_term_by_index(args.prev_log_index);
             debug!(
                 "{} : arg.prev_index: {}, term: {}, self.prev_index: {}, term: {}",
@@ -734,13 +734,15 @@ impl Raft {
                 self.state.last_applied.load(Ordering::SeqCst),
                 prev_log_term
             );
+            // return error to let leader decrease "next_index"
             if args.prev_log_index > self.state.last_applied.load(Ordering::SeqCst)
                 || (args.prev_log_term != prev_log_term && prev_log_term != 0)
             {
                 debug!("reject append entries rpc");
                 return (self.state.term(), false);
             }
-            // overwrite its own log with leader's
+            // if this rpc contains some entries that already exist in follower's log, follower's log
+            // will be truncate first in following block, then write entries contained in rpc into follower's log
             else if args.prev_log_index < self.state.last_applied.load(Ordering::SeqCst) {
                 let mut log = self.state.log.lock().unwrap();
                 log.truncate(args.prev_log_index as usize);
@@ -749,6 +751,7 @@ impl Raft {
                     .store(args.prev_log_index, Ordering::SeqCst);
             }
 
+            // write entries from rpc into follower's log
             let mut log = self.state.log.lock().unwrap();
             for entry_index in 0..args.entries.len() {
                 log.push((
@@ -756,9 +759,10 @@ impl Raft {
                     args.entries_term[entry_index],
                 ));
                 self.state.increase_last_applied();
+                // self.state.increase_commit_index();
             }
             drop(log);
-            // self.persist();
+            self.persist();
 
             let log = self.get_log();
             let leader_commit = args.leader_commit;
@@ -783,11 +787,14 @@ impl Raft {
                 }
             }
 
+            // todo: remove this, add `have new log` judge above instead
             if have_new_log {
                 self.persist();
             }
             (self.state.term(), true)
         } else {
+            // figure 2, rule 1
+            debug!("append entries rpc will return false");
             (self.state.term(), false)
         }
     }
