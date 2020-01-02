@@ -690,12 +690,13 @@ impl Raft {
             && is_up_to_date
         {
             *voted_for = Some(candidate_id);
+            // leader step down
             if self.state.term() < term {
                 self.tx
                     .send(IncomingRpcType::TurnToFollower)
                     .unwrap_or_default();
             }
-            self.state.current_term.store(term, Ordering::SeqCst);
+            // self.state.current_term.store(term, Ordering::SeqCst);
 
             debug!("{}\tgrant", self.me);
             return true;
@@ -762,14 +763,14 @@ impl Raft {
                 // self.state.increase_commit_index();
             }
             drop(log);
-            self.persist();
+            if !args.entries.is_empty() {
+                self.persist();
+            }
 
             let log = self.get_log();
             let leader_commit = args.leader_commit;
-            let mut have_new_log = false;
             if self.get_log_term_by_index(leader_commit) == self.get_term() {
                 for log_index in self.state.commit_index.load(Ordering::SeqCst)..leader_commit {
-                    have_new_log = true;
                     debug!(
                         "follower {} will commit {:?} with index {}",
                         self.me,
@@ -787,10 +788,6 @@ impl Raft {
                 }
             }
 
-            // todo: remove this, add `have new log` judge above instead
-            if have_new_log {
-                self.persist();
-            }
             (self.state.term(), true)
         } else {
             // figure 2, rule 1
