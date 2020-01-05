@@ -61,7 +61,7 @@ impl KvServer {
         let d = dup_cmd.clone();
 
         // let tx = committed_tx.clone();
-        let re_apply_tx = tx.clone();
+        let re_apply_tx = tx;
         let apl_token_for_capture = apl_token.clone();
         // let me_ = me.clone();
         let apply = apply_ch
