@@ -1,4 +1,5 @@
 use std::default::Default;
+// use std::future::Future as stdFuture;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -8,8 +9,13 @@ use std::time::Duration;
 use crossbeam::channel::{bounded, Receiver as CReceiver, Sender as CSender};
 use futures::sync::mpsc::UnboundedSender;
 use futures::Future;
+use futures03::channel::oneshot::{channel as oneshot, Receiver as OReceiver};
+// use futures03::executor::block_on;
+// use futures03::join;
 use labrpc::RpcFuture;
 use rand::Rng;
+// use tokio02::runtime::Runtime;
+// use tokio02::time::timeout;
 
 #[cfg(test)]
 pub mod config;
@@ -17,6 +23,7 @@ pub mod errors;
 pub mod persister;
 #[cfg(test)]
 mod tests;
+mod utils;
 
 use self::errors::*;
 use self::persister::*;
@@ -297,9 +304,9 @@ impl Raft {
         &self,
         server: usize,
         args: &RequestVoteArgs,
-    ) -> Receiver<Result<RequestVoteReply>> {
+    ) -> OReceiver<Result<RequestVoteReply>> {
         let peer = &self.peers[server];
-        let (tx, rx) = channel();
+        let (tx, rx) = oneshot();
         peer.spawn(
             peer.request_vote(&args)
                 .map_err(Error::Rpc)
@@ -317,6 +324,8 @@ impl Raft {
         server: usize,
         args: &AppendEntriesArgs,
     ) -> Receiver<Result<AppendEntriesReply>> {
+        // use crate::proto::raftpb::raft::__futures::Future;
+
         let peer = &peers[server];
         let (tx, rx) = channel();
         peer.spawn(
@@ -413,32 +422,49 @@ impl Raft {
 
                         let (tx, rx) = channel();
                         let majority = self.majority;
-                        let candidate_term = self.state.current_term.clone();
+                        let _candidate_term = self.state.current_term.clone();
                         // spawn a new thread to listen response from others and counts votes
                         thread::spawn(move || {
-                            let mut cnt = 1; // 1 for self
-                            while cnt < majority && !teller.is_empty() {
-                                teller.retain(|rcv| {
-                                    if let Ok(response) = rcv.try_recv() {
-                                        if let Ok(request_vote_reply) = response {
-                                            if request_vote_reply.vote_granted {
-                                                cnt += 1;
-                                                if cnt >= majority && tx.send(true).is_err() {}
-                                            } else if request_vote_reply.term
-                                                > candidate_term.load(Ordering::SeqCst)
-                                            {
-                                                candidate_term.store(
-                                                    request_vote_reply.term,
-                                                    Ordering::SeqCst,
-                                                );
-                                            }
-                                        }
-                                        return false;
-                                    }
-                                    true
-                                });
+                            use tokio02::runtime::Builder;
+                            use tokio02::time::timeout;
+                            let mut rt = Builder::new().enable_time().build().unwrap();
+                            debug!("{:?}", rt);
+                            let listener = utils::wait_vote_req_reply(teller, majority);
+                            let result = rt.block_on(async {
+                                timeout(Duration::from_millis(HEARTBEAT_INTERVAL.into()), listener)
+                                    .await
+                            });
+                            if let Ok(true) = result {
+                                tx.send(true).unwrap();
+                            } else {
+                                tx.send(false).unwrap();
                             }
-                            if tx.send(cnt >= majority).is_err() {}
+
+                            // let mut cnt = 1; // 1 for self
+                            // while cnt < majority && !teller.is_empty() {
+                            //     teller.retain(|rcv| {
+                            //         if let Ok(response) = rcv.try_recv() {
+                            //             if let Ok(request_vote_reply) = response {
+                            //                 if request_vote_reply.vote_granted {
+                            //                     cnt += 1;
+                            //                     if cnt >= majority && tx.send(true).is_err() {}
+                            //                 }
+                            //                 // for what? should stop listen
+                            //                 else if request_vote_reply.term
+                            //                     > candidate_term.load(Ordering::SeqCst)
+                            //                 {
+                            //                     candidate_term.store(
+                            //                         request_vote_reply.term,
+                            //                         Ordering::SeqCst,
+                            //                     );
+                            //                 }
+                            //             }
+                            //             return false;
+                            //         }
+                            //         true
+                            //     });
+                            // }
+                            // if tx.send(cnt >= majority).is_err() {}
                         });
 
                         clock = 0;
