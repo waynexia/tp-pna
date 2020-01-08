@@ -14,6 +14,8 @@ use futures03::channel::oneshot::{channel as oneshot, Receiver as OReceiver};
 // use futures03::join;
 use labrpc::RpcFuture;
 use rand::Rng;
+use tokio02::runtime::Builder;
+use tokio02::time::timeout;
 // use tokio02::runtime::Runtime;
 // use tokio02::time::timeout;
 
@@ -423,21 +425,18 @@ impl Raft {
                         let (tx, rx) = channel();
                         let majority = self.majority;
                         let _candidate_term = self.state.current_term.clone();
+                        let mut rt = Builder::new().enable_time().build().unwrap();
                         // spawn a new thread to listen response from others and counts votes
                         thread::spawn(move || {
-                            use tokio02::runtime::Builder;
-                            use tokio02::time::timeout;
-                            let mut rt = Builder::new().enable_time().build().unwrap();
-                            debug!("{:?}", rt);
                             let listener = utils::wait_vote_req_reply(teller, majority);
                             let result = rt.block_on(async {
                                 timeout(Duration::from_millis(HEARTBEAT_INTERVAL.into()), listener)
                                     .await
                             });
                             if let Ok(true) = result {
-                                tx.send(true).unwrap();
+                                tx.send(true).ok();
                             } else {
-                                tx.send(false).unwrap();
+                                tx.send(false).ok();
                             }
 
                             // let mut cnt = 1; // 1 for self
@@ -715,6 +714,7 @@ impl Raft {
             || self.state.term() < term)
             && is_up_to_date
         {
+            // will grant
             *voted_for = Some(candidate_id);
             // leader step down
             if self.state.term() < term {
@@ -728,7 +728,7 @@ impl Raft {
             return true;
         }
         debug!("{}\tnot grant", self.me);
-        self.state.current_term.store(term, Ordering::SeqCst);
+        // self.state.current_term.store(term, Ordering::SeqCst);
         false
     }
 
