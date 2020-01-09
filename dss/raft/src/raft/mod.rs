@@ -10,7 +10,7 @@ use crossbeam::channel::{bounded, Receiver as CReceiver, Sender as CSender};
 use futures::sync::mpsc::UnboundedSender;
 use futures::Future;
 use futures03::channel::oneshot::{channel as oneshot, Receiver as OReceiver};
-use futures03::future::FutureExt;
+// use futures03::future::FutureExt;
 // use futures03::executor::block_on;
 // use futures03::join;
 use labrpc::RpcFuture;
@@ -430,89 +430,46 @@ impl Raft {
                             teller.push(self.send_request_vote(server_index, &request_vote_args));
                         }
 
-                        // let (tx, rx) = channel();
+                        //copy variables
                         let majority = self.majority;
-                        let _candidate_term = self.state.current_term.clone();
-                        // spawn a new thread to listen response from others and counts votes
-                        // thread::spawn(move || {
-                        //     let listener = utils::wait_vote_req_reply(teller, majority);
-                        //     let result = rt.block_on(async {
-                        //         timeout(Duration::from_millis(election_timeout as u64), listener)
-                        //             .await
-                        //     });
-                        //     // won't update candidate's term. maybe not correct
-                        //     if let Ok(true) = result {
-                        //         tx.send(true).ok();
-                        //     } else {
-                        //         tx.send(false).ok();
-                        //     }
-                        // });
-
+                        let candidate_term = self.state.current_term.load(Ordering::SeqCst);
                         let election_timeout_tomove = election_timeout;
-
-                        let result = async move {
-                            let listener = utils::wait_vote_req_reply(teller, majority);
-                            let result = timeout(
-                                Duration::from_millis(election_timeout_tomove as u64),
-                                listener,
-                            )
-                            .await;
-                            // won't update candidate's term. maybe not correct
-                            if let Ok(true) = result {
-                                true
-                            } else {
-                                false
-                            }
-                        };
-
                         let voted_for_lock = self.state.voted_for.clone();
                         let server_state_lock_ = server_state_lock.clone();
                         let need_send_heartbeat_to_move = need_send_heartbeat.clone();
                         let state = self.get_state();
 
-                        let sth = result.then(|item| async move {
-                            if item {
-                                let mut voted_for = voted_for_lock.lock().unwrap();
-                                *voted_for = None;
-                                drop(voted_for);
-
-                                let mut server_state = server_state_lock_.lock().unwrap();
-                                *server_state = ServerStates::Leader;
-                                drop(server_state);
-
-                                state.is_leader.store(true, Ordering::SeqCst);
-                                state.reinit_next_index();
-                                // need to send heartbeat once become leader
-                                need_send_heartbeat_to_move.store(true, Ordering::SeqCst);
-
-                                // clock = HEARTBEAT_INTERVAL as u64 + 1;
+                        let result = async move {
+                            let listener =
+                                utils::wait_vote_req_reply(teller, majority, candidate_term);
+                            let result = timeout(
+                                Duration::from_millis(election_timeout_tomove as u64),
+                                listener,
+                            )
+                            .await;
+                            if let Ok((success, term)) = result {
+                                if success {
+                                    let mut voted_for = voted_for_lock.lock().unwrap();
+                                    *voted_for = None;
+                                    drop(voted_for);
+                                    let mut server_state = server_state_lock_.lock().unwrap();
+                                    *server_state = ServerStates::Leader;
+                                    drop(server_state);
+                                    state.is_leader.store(true, Ordering::SeqCst);
+                                    state.reinit_next_index();
+                                    // set clock to timeout. send heartbeat once become leader
+                                    need_send_heartbeat_to_move.store(true, Ordering::SeqCst);
+                                } else if term > state.term() {
+                                    state.current_term.store(term, Ordering::SeqCst);
+                                }
                             }
-                        });
+                        };
 
                         thread::spawn(move || {
-                            Runtime::new().unwrap().block_on(sth);
+                            Runtime::new().unwrap().block_on(result);
                         });
-                        // rt.block_on(sth);
-                        // rt.spawn(sth);
 
                         clock = 0;
-                        //     teller_rx = rx;
-                        //     wating_vote_result = true;
-                        // } else if wating_vote_result {
-                        //     if let Ok(result) = teller_rx.try_recv() {
-                        //         if result {
-                        //             let mut voted_for = self.state.voted_for.lock().unwrap();
-                        //             *voted_for = None;
-                        //             drop(voted_for);
-                        //             server_state = ServerStates::Leader;
-                        //             self.state.is_leader.store(true, Ordering::SeqCst);
-                        //             self.state.reinit_next_index();
-                        //             // new leader should send heartbeat
-                        //             clock = HEARTBEAT_INTERVAL as u64 + 1;
-                        //         }
-                        //         election_timeout = rng.gen_range(MIN_TIMEOUT, MAX_TIMEOUT);
-                        //         wating_vote_result = false;
-                        //     }
                     }
                 }
 

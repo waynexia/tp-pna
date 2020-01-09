@@ -6,7 +6,7 @@ use futures03::future::{select_all, FutureExt};
 use super::errors::Error;
 use crate::proto::raftpb::*;
 
-pub async fn wait_vote_req_reply<V>(voters: V, majority: usize) -> bool
+pub async fn wait_vote_req_reply<V>(voters: V, majority: usize, candidate_term: u64) -> (bool, u64)
 where
     V: IntoIterator,
     <V as IntoIterator>::Item: Future<Output = Result<Result<RequestVoteReply, Error>, Canceled>>,
@@ -21,6 +21,8 @@ where
         if let Ok(Ok(result)) = reply {
             if result.vote_granted {
                 cnt += 1;
+            } else if result.term > candidate_term {
+                return (false, result.term);
             }
         }
         if voters.is_empty() {
@@ -28,5 +30,5 @@ where
         }
         sth = select_all(voters);
     }
-    cnt >= majority
+    (cnt >= majority, candidate_term)
 }
