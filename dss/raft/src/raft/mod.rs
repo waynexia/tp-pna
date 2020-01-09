@@ -4,20 +4,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam::channel::{bounded, Receiver as CReceiver, Sender as CSender};
 use futures::sync::mpsc::UnboundedSender;
 use futures::Future;
 use futures03::channel::oneshot::{channel as oneshot, Receiver as OReceiver};
+use futures03::future::FutureExt;
 // use futures03::executor::block_on;
 // use futures03::join;
 use labrpc::RpcFuture;
 use rand::Rng;
-use tokio02::runtime::Builder;
+use tokio02::runtime::Runtime;
 use tokio02::time::timeout;
-// use tokio02::runtime::Runtime;
-// use tokio02::time::timeout;
 
 #[cfg(test)]
 pub mod config;
@@ -32,7 +31,7 @@ use self::persister::*;
 use crate::proto::raftpb::*;
 use crate::proto::PresistentState;
 
-const MIN_TIMEOUT: u16 = 200;
+const MIN_TIMEOUT: u16 = 200; // in millis
 const MAX_TIMEOUT: u16 = 350;
 const HEARTBEAT_INTERVAL: u16 = 150;
 const APPEND_LISTEN_PERIOD: u16 = 100;
@@ -375,33 +374,42 @@ impl Raft {
 
     pub fn start_state_machine(&self) {
         let action_interval = Duration::new(0, ACTION_INTERVAL);
-        let mut clock: u16 = 0;
+        let mut ticktock = Instant::now();
+        let mut clock: u64 = 0;
 
         let mut rng = rand::thread_rng();
         let mut election_timeout = rng.gen_range(MIN_TIMEOUT, MAX_TIMEOUT);
 
-        let mut server_state = ServerStates::Follower;
-        let (_, rx) = channel();
-        let mut teller_rx: Receiver<bool> = rx;
+        let server_state_lock = Arc::new(Mutex::new(ServerStates::Follower));
+        // let (_, rx) = channel();
+        // let mut teller_rx: Receiver<bool> = rx;
         let (_, rx) = channel();
         let mut append_entries_rx: Receiver<bool> = rx;
         let (append_entries_reply_tx, append_entries_reply_rx) = channel();
         let mut wating_vote_result = false;
         let mut wating_append_result = false;
+        let need_send_heartbeat = Arc::new(AtomicBool::new(false));
+        // let mut rt = Runtime::new().unwrap();
 
         // this raft instance is killed or not
         let mut killed = false;
 
         while !killed {
-            match server_state {
+            let server_state = server_state_lock.lock().unwrap();
+            match *server_state {
                 ServerStates::Follower => {
-                    server_state = ServerStates::Candidate;
+                    drop(server_state);
+                    let mut server_state = server_state_lock.lock().unwrap();
+                    *server_state = ServerStates::Candidate;
+                    drop(server_state);
                     continue;
                 }
 
                 ServerStates::Candidate => {
-                    if clock > election_timeout {
+                    drop(server_state);
+                    if clock > election_timeout as u64 {
                         // begin to send request vote RPC
+                        election_timeout = rng.gen_range(MIN_TIMEOUT, MAX_TIMEOUT);
                         self.state.increase_term();
                         let mut voted_for = self.state.voted_for.lock().unwrap();
                         *voted_for = Some(self.me as u64);
@@ -422,72 +430,98 @@ impl Raft {
                             teller.push(self.send_request_vote(server_index, &request_vote_args));
                         }
 
-                        let (tx, rx) = channel();
+                        // let (tx, rx) = channel();
                         let majority = self.majority;
                         let _candidate_term = self.state.current_term.clone();
-                        let mut rt = Builder::new().enable_time().build().unwrap();
                         // spawn a new thread to listen response from others and counts votes
-                        thread::spawn(move || {
+                        // thread::spawn(move || {
+                        //     let listener = utils::wait_vote_req_reply(teller, majority);
+                        //     let result = rt.block_on(async {
+                        //         timeout(Duration::from_millis(election_timeout as u64), listener)
+                        //             .await
+                        //     });
+                        //     // won't update candidate's term. maybe not correct
+                        //     if let Ok(true) = result {
+                        //         tx.send(true).ok();
+                        //     } else {
+                        //         tx.send(false).ok();
+                        //     }
+                        // });
+
+                        let election_timeout_tomove = election_timeout;
+
+                        let result = async move {
                             let listener = utils::wait_vote_req_reply(teller, majority);
-                            let result = rt.block_on(async {
-                                timeout(Duration::from_millis(HEARTBEAT_INTERVAL.into()), listener)
-                                    .await
-                            });
+                            let result = timeout(
+                                Duration::from_millis(election_timeout_tomove as u64),
+                                listener,
+                            )
+                            .await;
+                            // won't update candidate's term. maybe not correct
                             if let Ok(true) = result {
-                                tx.send(true).ok();
+                                true
                             } else {
-                                tx.send(false).ok();
+                                false
                             }
+                        };
 
-                            // let mut cnt = 1; // 1 for self
-                            // while cnt < majority && !teller.is_empty() {
-                            //     teller.retain(|rcv| {
-                            //         if let Ok(response) = rcv.try_recv() {
-                            //             if let Ok(request_vote_reply) = response {
-                            //                 if request_vote_reply.vote_granted {
-                            //                     cnt += 1;
-                            //                     if cnt >= majority && tx.send(true).is_err() {}
-                            //                 }
-                            //                 // for what? should stop listen
-                            //                 else if request_vote_reply.term
-                            //                     > candidate_term.load(Ordering::SeqCst)
-                            //                 {
-                            //                     candidate_term.store(
-                            //                         request_vote_reply.term,
-                            //                         Ordering::SeqCst,
-                            //                     );
-                            //                 }
-                            //             }
-                            //             return false;
-                            //         }
-                            //         true
-                            //     });
-                            // }
-                            // if tx.send(cnt >= majority).is_err() {}
-                        });
+                        let voted_for_lock = self.state.voted_for.clone();
+                        let server_state_lock_ = server_state_lock.clone();
+                        let need_send_heartbeat_to_move = need_send_heartbeat.clone();
+                        let state = self.get_state();
 
-                        clock = 0;
-                        election_timeout = rng.gen_range(MIN_TIMEOUT, MAX_TIMEOUT);
-                        teller_rx = rx;
-                        wating_vote_result = true;
-                    } else if wating_vote_result {
-                        if let Ok(result) = teller_rx.try_recv() {
-                            if result {
-                                server_state = ServerStates::Leader;
-                                let mut voted_for = self.state.voted_for.lock().unwrap();
+                        let sth = result.then(|item| async move {
+                            if item {
+                                let mut voted_for = voted_for_lock.lock().unwrap();
                                 *voted_for = None;
                                 drop(voted_for);
-                                self.state.is_leader.store(true, Ordering::SeqCst);
-                                self.state.reinit_next_index();
-                                clock = HEARTBEAT_INTERVAL + 1;
+
+                                let mut server_state = server_state_lock_.lock().unwrap();
+                                *server_state = ServerStates::Leader;
+                                drop(server_state);
+
+                                state.is_leader.store(true, Ordering::SeqCst);
+                                state.reinit_next_index();
+                                // need to send heartbeat once become leader
+                                need_send_heartbeat_to_move.store(true, Ordering::SeqCst);
+
+                                // clock = HEARTBEAT_INTERVAL as u64 + 1;
                             }
-                            wating_vote_result = false;
-                        }
+                        });
+
+                        thread::spawn(move || {
+                            Runtime::new().unwrap().block_on(sth);
+                        });
+                        // rt.block_on(sth);
+                        // rt.spawn(sth);
+
+                        clock = 0;
+                        //     teller_rx = rx;
+                        //     wating_vote_result = true;
+                        // } else if wating_vote_result {
+                        //     if let Ok(result) = teller_rx.try_recv() {
+                        //         if result {
+                        //             let mut voted_for = self.state.voted_for.lock().unwrap();
+                        //             *voted_for = None;
+                        //             drop(voted_for);
+                        //             server_state = ServerStates::Leader;
+                        //             self.state.is_leader.store(true, Ordering::SeqCst);
+                        //             self.state.reinit_next_index();
+                        //             // new leader should send heartbeat
+                        //             clock = HEARTBEAT_INTERVAL as u64 + 1;
+                        //         }
+                        //         election_timeout = rng.gen_range(MIN_TIMEOUT, MAX_TIMEOUT);
+                        //         wating_vote_result = false;
+                        //     }
                     }
                 }
 
                 ServerStates::Leader => {
-                    if clock > HEARTBEAT_INTERVAL {
+                    drop(server_state);
+                    if clock > HEARTBEAT_INTERVAL as u64
+                        || need_send_heartbeat.load(Ordering::SeqCst)
+                    {
+                        need_send_heartbeat.store(false, Ordering::SeqCst);
                         // for receiving ack from followers
                         let (tx, rx) = channel();
                         let term = self.get_term();
@@ -573,7 +607,7 @@ impl Raft {
                                 step_down_tx,
                                 majority as u64,
                                 tx,
-                                action_interval,
+                                // action_interval,
                                 append_entries_reply_tx,
                             )
                         });
@@ -629,13 +663,18 @@ impl Raft {
 
             self.listen_incomming_message(
                 &mut killed,
-                &mut server_state,
+                server_state_lock.clone(),
                 &mut clock,
                 &mut wating_vote_result,
             );
 
-            clock += 1;
-            thread::sleep(action_interval);
+            if ticktock.elapsed().as_millis() != 0 {
+                clock += ticktock.elapsed().as_millis() as u64;
+                ticktock = Instant::now();
+            } else {
+                // clock += 1;
+                thread::sleep(action_interval);
+            }
         }
     }
 
@@ -829,7 +868,7 @@ impl Raft {
         step_down_tx: CSender<IncomingRpcType>,
         majority: u64,
         tx: Sender<bool>,
-        action_interval: std::time::Duration,
+        // action_interval: std::time::Duration,
         append_entries_reply_tx: Sender<Vec<(usize, bool)>>,
     ) {
         let mut cnt = 1;
@@ -872,7 +911,7 @@ impl Raft {
                 break;
             }
             clock += 1;
-            thread::sleep(action_interval);
+            thread::sleep(Duration::new(0, ACTION_INTERVAL));
         }
         tx.send(cnt >= majority).unwrap_or_default();
         append_entries_reply_tx.send(reply).unwrap_or_default();
@@ -881,8 +920,8 @@ impl Raft {
     fn listen_incomming_message(
         &self,
         killed: &mut bool,
-        server_state: &mut ServerStates,
-        clock: &mut u16,
+        server_state_lock: Arc<Mutex<ServerStates>>,
+        clock: &mut u64,
         wating_vote_result: &mut bool,
     ) {
         // try to receive heartbeat
@@ -894,12 +933,16 @@ impl Raft {
             if !self.is_leader() {
                 if signal == IncomingRpcType::RequestVote {
                     // need to judge term
+                    let mut server_state = server_state_lock.lock().unwrap();
                     *server_state = ServerStates::Follower;
+                    drop(server_state);
                     *wating_vote_result = false;
                 }
             } else if signal == IncomingRpcType::TurnToFollower {
                 // need to judge term
+                let mut server_state = server_state_lock.lock().unwrap();
                 *server_state = ServerStates::Follower;
+                drop(server_state);
                 debug!(
                     "leader {}, term: {} will turn to follower",
                     self.me,
