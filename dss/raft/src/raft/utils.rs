@@ -43,7 +43,6 @@ where
 /// success or not, new term if needed, follower's feedback on `prevLogTerm`
 pub async fn wait_append_req_reply<V>(
     followers: V,
-    mut ids: Vec<usize>,
     majority: usize,
     leader_term: u64,
     append_listen_period: u16,
@@ -56,13 +55,6 @@ where
     <V as IntoIterator>::Item: Unpin,
 {
     let mut cnt = 1;
-    // let mut ids = vec![];
-    // let mut followers = vec![];
-    // for (fut, id) in followers_arg {
-    //     followers.push(fut.fuse());
-    //     ids.push(id);
-    // }
-    // followers.map(|item| item.fuse());
     let mut selected = select_all(
         followers
             .into_iter()
@@ -70,16 +62,14 @@ where
     );
     let mut feedback = vec![];
 
-    // while cnt < majority {
     loop {
-        let (recv, index, followers) = selected.await;
+        let (recv, _, followers) = selected.await;
         if let Ok(Ok(Ok(append_entries_reply))) = recv {
-            // record follower's reply
+            // record follower's feedback
             feedback.push((
                 append_entries_reply.me as usize,
                 append_entries_reply.success,
             ));
-            ids.remove(index);
 
             if append_entries_reply.success {
                 cnt += 1;

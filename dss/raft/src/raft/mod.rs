@@ -447,13 +447,7 @@ impl Raft {
         let mut election_timeout = rng.gen_range(MIN_TIMEOUT, MAX_TIMEOUT);
 
         let server_state_lock = Arc::new(Mutex::new(ServerStates::Follower));
-        // let (_, rx) = channel();
-        // let mut teller_rx: Receiver<bool> = rx;
-        // let (_, rx) = channel();
-        // let mut append_entries_rx: Receiver<bool> = rx;
-        // let (append_entries_reply_tx, append_entries_reply_rx) = channel();
         let mut wating_vote_result = false;
-        // let mut wating_append_result = false;
         let need_send_heartbeat = Arc::new(AtomicBool::new(false));
         // let mut rt = Runtime::new().unwrap();
 
@@ -464,6 +458,7 @@ impl Raft {
             let server_state = server_state_lock.lock().unwrap();
             match *server_state {
                 ServerStates::Follower => {
+                    // follower in waiting can be treated as candidate not timeout
                     drop(server_state);
                     let mut server_state = server_state_lock.lock().unwrap();
                     *server_state = ServerStates::Candidate;
@@ -474,12 +469,13 @@ impl Raft {
                 ServerStates::Candidate => {
                     drop(server_state);
                     if clock > election_timeout as u64 {
-                        // begin to send request vote RPC
+                        // send request vote RPC
                         election_timeout = rng.gen_range(MIN_TIMEOUT, MAX_TIMEOUT);
                         self.state.increase_term();
                         let mut voted_for = self.state.voted_for.lock().unwrap();
                         *voted_for = Some(self.me as u64);
                         drop(voted_for);
+                        // construct rpc
                         let last_log_term =
                             self.get_log().as_slice().last().unwrap_or(&(vec![], 0)).1;
                         let request_vote_args = RequestVoteArgs {
@@ -488,6 +484,7 @@ impl Raft {
                             last_log_index: self.state.last_applied.load(Ordering::SeqCst),
                             last_log_term,
                         };
+                        // send
                         let mut teller = vec![];
                         for server_index in 0..self.peers.len() {
                             if server_index == self.me {
@@ -505,6 +502,7 @@ impl Raft {
                         let need_send_heartbeat_to_move = need_send_heartbeat.clone();
                         let state = self.get_state();
 
+                        // listener future
                         let result = async move {
                             let listener =
                                 utils::wait_vote_req_reply(teller, majority, candidate_term);
@@ -531,10 +529,12 @@ impl Raft {
                             }
                         };
 
+                        // todo: use runtime.spawn()
                         thread::spawn(move || {
                             Runtime::new().unwrap().block_on(result);
                         });
 
+                        // reset clock
                         clock = 0;
                     }
                 }
@@ -545,21 +545,14 @@ impl Raft {
                         || need_send_heartbeat.load(Ordering::SeqCst)
                     {
                         need_send_heartbeat.store(false, Ordering::SeqCst);
-                        // for receiving ack from followers
-                        // let (tx, rx) = channel();
+                        // send append entries (heartbeat) rpc
                         let term = self.get_term();
                         let leader_id = self.me;
                         let num_peers = self.peers.len();
                         let peers = self.peers.clone();
                         let majority = self.majority;
-
-                        // adjust last_applied based on reply from last AppendEntriesRpc
-                        // if let Ok(feedback) = append_entries_reply_rx.try_recv() {
-                        //     self.adjust_next_index(feedback);
-                        // }
                         let next_index = self.state.get_next_index();
                         let mut follower_tx = vec![];
-                        let mut ids = vec![];
                         let leader_commit = self.state.commit_index.load(Ordering::SeqCst);
                         let log = self.get_log();
                         let log_length = log.len();
@@ -567,6 +560,7 @@ impl Raft {
                             .last_applied
                             .store(log_length as u64, Ordering::SeqCst);
 
+                        // construct rpc and send to followers
                         for index in 0..num_peers {
                             if index == leader_id {
                                 continue;
@@ -574,11 +568,6 @@ impl Raft {
 
                             // construct entry list by `next_index` for every single peer
                             let prev_log_index = next_index[index];
-                            // let prev_log_term = if prev_log_index > 0 {
-                            //     self.get_log()[prev_log_index as usize - 1].1
-                            // } else {
-                            //     0
-                            // };
                             let prev_log_term = self.get_log_term_by_index(prev_log_index);
                             let entries_to_send = if log_length > 0 {
                                 log[next_index[index] as usize..log_length]
@@ -612,7 +601,6 @@ impl Raft {
                                 index.to_owned(),
                                 &append_entries_args,
                             ));
-                            ids.push(index);
                         }
 
                         let state = self.get_state();
@@ -623,7 +611,6 @@ impl Raft {
                         let result = async move {
                             let (success, term, feedback) = utils::wait_append_req_reply(
                                 follower_tx,
-                                ids,
                                 majority,
                                 state.term(),
                                 APPEND_LISTEN_PERIOD,
@@ -631,15 +618,13 @@ impl Raft {
                             .await;
                             debug!("{} received result: {}", me, success);
                             if success {
-                                // todo: adjust `nextIndex`
+                                // adjust `nextIndex`
                                 debug!("feedback: {:?}", feedback);
                                 state.adjust_next_index(feedback);
 
-                                // apply new log
+                                // apply log into apply_ch if log in this term is existing in majority
                                 let log = state.get_log();
                                 let mut have_new_commit = false;
-                                // commit command(s) into apply_ch here if log in this term is
-                                // existing in majority peers
                                 if state.get_log_term_by_index(
                                     state.last_applied.load(Ordering::SeqCst),
                                 ) == state.term()
@@ -680,10 +665,12 @@ impl Raft {
                             }
                         };
 
+                        // todo: use runtime.spawn()
                         thread::spawn(move || {
                             Runtime::new().unwrap().block_on(result);
                         });
 
+                        // reset clock
                         clock = 0;
                     }
                 }
@@ -696,11 +683,12 @@ impl Raft {
                 &mut wating_vote_result,
             );
 
+            // step timer
             if ticktock.elapsed().as_millis() != 0 {
                 clock += ticktock.elapsed().as_millis() as u64;
                 ticktock = Instant::now();
             } else {
-                // clock += 1;
+                // server isn't busy, sleep for a while
                 thread::sleep(action_interval);
             }
         }
