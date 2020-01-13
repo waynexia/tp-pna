@@ -34,7 +34,7 @@ use crate::proto::PresistentState;
 const MIN_TIMEOUT: u16 = 150; // in millis
 const MAX_TIMEOUT: u16 = 300;
 const HEARTBEAT_INTERVAL: u16 = 100;
-const APPEND_LISTEN_PERIOD: u16 = 300;
+const APPEND_LISTEN_PERIOD: u16 = 100;
 const ACTION_INTERVAL: u32 = 1_000_000; // in nano
 
 pub struct ApplyMsg {
@@ -280,36 +280,6 @@ impl Raft {
 
     pub fn get_log(&self) -> Vec<(Vec<u8>, u64)> {
         self.state.log.lock().unwrap().to_vec()
-    }
-
-    /// save Raft's persistent state to stable storage,
-    /// where it can later be retrieved after a crash and restart.
-    /// see paper's Figure 2 for a description of what should be persistent.
-    fn persist(&self) {
-        let mut data = vec![];
-
-        // seperate log into two vector for presisting
-        let mut sep_log = vec![];
-        let mut sep_term = vec![];
-        // last_applied means the last entries that has been replied to leader.
-        let last_applied = self.state.last_applied.load(Ordering::SeqCst) as usize;
-        let log = self.get_log()[..last_applied].to_vec();
-        for (l, t) in log {
-            sep_log.push(l.clone());
-            sep_term.push(t);
-        }
-
-        let voted_for = self.state.get_voted_for();
-        let presistent_state = PresistentState {
-            current_term: self.get_term(),
-            voted_for,
-            log: sep_log,
-            log_term: sep_term,
-        };
-        labcodec::encode(&presistent_state, &mut data).unwrap();
-        self.persister.lock().unwrap().save_raft_state(data);
-
-        debug!("{} presisted!", self.me);
     }
 
     /// restore previously persisted state.
@@ -616,12 +586,11 @@ impl Raft {
                                 APPEND_LISTEN_PERIOD,
                             )
                             .await;
+                            // adjust `nextIndex`
+                            debug!("feedback: {:?}", feedback);
+                            state.adjust_next_index(feedback);
                             debug!("{} received result: {}", me, success);
                             if success {
-                                // adjust `nextIndex`
-                                debug!("feedback: {:?}", feedback);
-                                state.adjust_next_index(feedback);
-
                                 // apply log into apply_ch if log in this term is existing in majority
                                 let log = state.get_log();
                                 let mut have_new_commit = false;
@@ -719,135 +688,161 @@ impl Raft {
         candidate_id: u64,
         last_log_index: u64,
         last_log_term: u64,
-    ) -> bool {
-        let mut voted_for = self.state.voted_for.lock().unwrap();
+    ) -> RpcFuture<RequestVoteReply> {
+        let state = self.get_state();
+        let tx = self.tx.clone();
+        let me = self.me;
+        let future = futures::future::result(Ok(true)).and_then(move |_| {
+            let mut voted_for = state.voted_for.lock().unwrap();
 
-        // first look at term, if the same then look at `voted_for`, otherwise need not.
-        // after that look at index
-        let self_last_log_term = self.get_log().as_slice().last().unwrap_or(&(vec![], 0)).1;
-        let is_up_to_date = self_last_log_term < last_log_term // up to date
-                    || (self_last_log_term == last_log_term
-                        && self.state.last_applied.load(Ordering::SeqCst) <= last_log_index);
-        debug!("self: {} (voted for:{:?}) received a vote request, candidate is {}, last log index is {}, own is {}  term is {}, own is {}, last log term is {}, its own is {}, up to date: {}",
-            self.me,
-            voted_for,candidate_id,
-            last_log_index,
-            self.state.last_applied.load(Ordering::SeqCst),
-            term, self.state.term(),
-            last_log_term,
-            self_last_log_term,
-            is_up_to_date);
-        if ((self.state.term() == term
-            && (voted_for.is_none() || *voted_for.as_ref().unwrap() == candidate_id))
-            || self.state.term() < term)
-            && is_up_to_date
-        {
-            // will grant
-            *voted_for = Some(candidate_id);
-            // leader step down
-            if self.state.term() < term {
-                self.tx
-                    .send(IncomingRpcType::TurnToFollower)
-                    .unwrap_or_default();
+            // first look at term, if the same then look at `voted_for`, otherwise need not.
+            // after that look at index
+            let self_last_log_term = state.get_log().as_slice().last().unwrap_or(&(vec![], 0)).1;
+            let is_up_to_date = self_last_log_term < last_log_term // up to date
+                            || (self_last_log_term == last_log_term
+                                && state.last_applied.load(Ordering::SeqCst) <= last_log_index);
+            debug!("self: {} (voted for:{:?}) received a vote request, candidate is {}, last log index is {}, own is {}  term is {}, own is {}, last log term is {}, its own is {}, up to date: {}",
+                me,
+                voted_for,candidate_id,
+                last_log_index,
+                state.last_applied.load(Ordering::SeqCst),
+                term, state.term(),
+                last_log_term,
+                self_last_log_term,
+                is_up_to_date);
+            if ((state.term() == term
+                && (voted_for.is_none() || *voted_for.as_ref().unwrap() == candidate_id))
+                || state.term() < term)
+                && is_up_to_date
+            {
+                // will grant
+                *voted_for = Some(candidate_id);
+                // leader step down
+                if state.term() < term {
+                    tx.send(IncomingRpcType::TurnToFollower).unwrap_or_default();
+                }
+                debug!("{}\tgrant", me);
+                return Box::new(futures::future::result(Ok(RequestVoteReply {
+                    term:state.term(),
+                    vote_granted: true,
+                })));
             }
-            // self.state.current_term.store(term, Ordering::SeqCst);
-
-            debug!("{}\tgrant", self.me);
-            return true;
-        }
-        debug!("{}\tnot grant", self.me);
-        // self.state.current_term.store(term, Ordering::SeqCst);
-        false
+            debug!("{}\tnot grant", me);
+            Box::new(futures::future::result(Ok(RequestVoteReply {
+                term:state.term(),
+                vote_granted: false,
+            })))
+        });
+        Box::new(future)
+        // future
     }
 
     /// try to append a entries. return the current_term in success, 0 in error.
-    pub fn append_entries(&self, args: AppendEntriesArgs) -> (u64, bool) {
+    pub fn append_entries(&self, args: AppendEntriesArgs) -> RpcFuture<AppendEntriesReply> {
         // if is not leader, send to apply_ch to commit,
         // if is really leader, will not run into this function
         // leader should call apply_ch in state machine
 
-        debug!(
-            "No. {} (last applied: {}, term: {}) received {:?}",
-            self.me,
-            self.state.last_applied.load(Ordering::SeqCst),
-            self.get_term(),
-            args
-        );
+        let state = self.get_state();
+        let tx = self.tx.clone();
+        let me = self.me as u64;
+        let persister = self.persister.clone();
+        let apply_ch = self.apply_ch.clone();
 
-        if args.term >= self.state.current_term.load(Ordering::SeqCst) {
-            self.tx
-                .send(IncomingRpcType::TurnToFollower)
-                .unwrap_or_default();
-            self.state.current_term.store(args.term, Ordering::SeqCst);
-
-            let prev_log_term = self.get_log_term_by_index(args.prev_log_index);
+        let future = futures::future::result(Ok(true)).and_then(move |_| {
             debug!(
-                "{} : arg.prev_index: {}, term: {}, self.prev_index: {}, term: {}",
-                self.me,
-                args.prev_log_index,
-                args.prev_log_term,
-                self.state.last_applied.load(Ordering::SeqCst),
-                prev_log_term
+                "No. {} (last applied: {}, term: {}) received {:?}",
+                me,
+                state.last_applied.load(Ordering::SeqCst),
+                state.term(),
+                args
             );
-            // return error to let leader decrease "next_index"
-            if args.prev_log_index > self.state.last_applied.load(Ordering::SeqCst)
-                || (args.prev_log_term != prev_log_term && prev_log_term != 0)
-            {
-                debug!("{} reject append entries rpc", self.me);
-                return (self.state.term(), false);
-            }
-            // if this rpc contains some entries that already exist in follower's log, follower's log
-            // will be truncate first in following block, then write entries contained in rpc into follower's log
-            else if args.prev_log_index < self.state.last_applied.load(Ordering::SeqCst) {
-                let mut log = self.state.log.lock().unwrap();
-                log.truncate(args.prev_log_index as usize);
-                self.state
-                    .last_applied
-                    .store(args.prev_log_index, Ordering::SeqCst);
-            }
-
-            // write entries from rpc into follower's log
-            let mut log = self.state.log.lock().unwrap();
-            for entry_index in 0..args.entries.len() {
-                log.push((
-                    args.entries[entry_index].clone(),
-                    args.entries_term[entry_index],
-                ));
-                self.state.increase_last_applied();
-                // self.state.increase_commit_index();
-            }
-            drop(log);
-            if !args.entries.is_empty() {
-                self.persist();
-            }
-
-            let log = self.get_log();
-            let leader_commit = args.leader_commit;
-            if self.get_log_term_by_index(leader_commit) == self.get_term() {
-                for log_index in self.state.commit_index.load(Ordering::SeqCst)..leader_commit {
-                    debug!(
-                        "follower {} will commit {:?} with index {}",
-                        self.me,
-                        log[log_index as usize],
-                        log_index + 1,
-                    );
-                    self.apply_ch
-                        .unbounded_send(ApplyMsg {
-                            command_valid: true,
-                            command: log[log_index as usize].0.clone(),
-                            command_index: log_index + 1,
-                        })
-                        .unwrap();
-                    self.state.increase_commit_index();
+            if args.term >= state.current_term.load(Ordering::SeqCst) {
+                tx.send(IncomingRpcType::TurnToFollower).unwrap_or_default();
+                state.current_term.store(args.term, Ordering::SeqCst);
+                let prev_log_term = state.get_log_term_by_index(args.prev_log_index);
+                debug!(
+                    "{} : arg.prev_index: {}, term: {}, self.prev_index: {}, term: {}",
+                    me,
+                    args.prev_log_index,
+                    args.prev_log_term,
+                    state.last_applied.load(Ordering::SeqCst),
+                    prev_log_term
+                );
+                // return error to let leader decrease "next_index"
+                if args.prev_log_index > state.last_applied.load(Ordering::SeqCst)
+                    || (args.prev_log_term != prev_log_term && prev_log_term != 0)
+                {
+                    debug!("{} reject append entries rpc", me);
+                    // return (state.term(), false);
+                    return Box::new(futures::future::result(Ok(AppendEntriesReply {
+                        term: state.term(),
+                        success: false,
+                        me,
+                    })));
                 }
+                // if this rpc contains some entries that already exist in follower's log, follower's log
+                // will be truncate first in following block, then write entries contained in rpc into follower's log
+                else if args.prev_log_index < state.last_applied.load(Ordering::SeqCst) {
+                    let mut log = state.log.lock().unwrap();
+                    log.truncate(args.prev_log_index as usize);
+                    state
+                        .last_applied
+                        .store(args.prev_log_index, Ordering::SeqCst);
+                }
+                // write entries from rpc into follower's log
+                let mut log = state.log.lock().unwrap();
+                for entry_index in 0..args.entries.len() {
+                    log.push((
+                        args.entries[entry_index].clone(),
+                        args.entries_term[entry_index],
+                    ));
+                    state.increase_last_applied();
+                    // self.state.increase_commit_index();
+                }
+                drop(log);
+                if !args.entries.is_empty() {
+                    state.persist(persister);
+                }
+                let log = state.get_log();
+                let leader_commit = args.leader_commit;
+                if state.get_log_term_by_index(leader_commit) == state.term() {
+                    for log_index in state.commit_index.load(Ordering::SeqCst)..leader_commit {
+                        debug!(
+                            "follower {} will commit {:?} with index {}",
+                            me,
+                            log[log_index as usize],
+                            log_index + 1,
+                        );
+                        apply_ch
+                            .unbounded_send(ApplyMsg {
+                                command_valid: true,
+                                command: log[log_index as usize].0.clone(),
+                                command_index: log_index + 1,
+                            })
+                            .unwrap();
+                        state.increase_commit_index();
+                    }
+                }
+                Box::new(futures::future::result(Ok(AppendEntriesReply {
+                    term: state.term(),
+                    success: true,
+                    me,
+                })))
+            // (self.state.term(), true)
+            } else {
+                // figure 2, rule 1
+                debug!("append entries rpc will return false");
+                // (self.state.term(), false)
+                Box::new(futures::future::result(Ok(AppendEntriesReply {
+                    term: state.term(),
+                    success: false,
+                    me,
+                })))
             }
+        });
 
-            (self.state.term(), true)
-        } else {
-            // figure 2, rule 1
-            debug!("append entries rpc will return false");
-            (self.state.term(), false)
-        }
+        Box::new(future)
     }
 
     fn listen_incomming_message(
@@ -982,37 +977,17 @@ impl RaftService for Node {
     //
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     fn request_vote(&self, args: RequestVoteArgs) -> RpcFuture<RequestVoteReply> {
-        let raft = self.raft.clone();
-        let term = raft.get_term();
-
-        if raft.vote_for(
+        self.raft.tx.send(IncomingRpcType::RequestVote).unwrap();
+        self.raft.vote_for(
             args.term,
             args.candidate_id,
             args.last_log_index,
             args.last_log_term,
-        ) {
-            raft.tx.send(IncomingRpcType::RequestVote).unwrap();
-            Box::new(futures::future::result(Ok(RequestVoteReply {
-                term,
-                vote_granted: true,
-            })))
-        } else {
-            Box::new(futures::future::result(Ok(RequestVoteReply {
-                term,
-                vote_granted: false,
-            })))
-        }
+        )
     }
 
     fn append_entries(&self, args: AppendEntriesArgs) -> RpcFuture<AppendEntriesReply> {
-        let raft = self.raft.clone();
-
-        let (term, success) = raft.append_entries(args);
-        raft.tx.send(IncomingRpcType::AppendEntries).unwrap();
-        Box::new(futures::future::result(Ok(AppendEntriesReply {
-            term,
-            success,
-            me: self.raft.me as u64,
-        })))
+        self.raft.tx.send(IncomingRpcType::AppendEntries).unwrap();
+        self.raft.append_entries(args)
     }
 }
