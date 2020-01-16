@@ -1,5 +1,7 @@
 #![feature(integer_atomics)]
 #![deny(clippy::all)]
+// for atomic fetch_max
+#![feature(atomic_min_max)]
 
 #[allow(unused_imports)]
 #[macro_use]
