@@ -7,6 +7,7 @@ pub enum Error {
     Encode(labcodec::EncodeError),
     Decode(labcodec::DecodeError),
     Rpc(labrpc::Error),
+    NeedResend(usize),
     NotLeader,
 }
 

@@ -339,24 +339,7 @@ impl Raft {
     /// is no need to implement your own timeouts around this method.
     ///
     /// look at the comments in ../labrpc/src/lib.rs for more details.
-    fn send_request_vote(
-        &self,
-        server: usize,
-        args: &RequestVoteArgs,
-    ) -> OReceiver<Result<RequestVoteReply>> {
-        let peer = &self.peers[server];
-        let (tx, rx) = oneshot();
-        peer.spawn(
-            peer.request_vote(&args)
-                .map_err(Error::Rpc)
-                .then(move |res| {
-                    tx.send(res).unwrap_or_default(); // Supress Unused Result
-                    Ok(())
-                }),
-        );
-        rx
-    }
-
+    ///
     /// send append entries rpc
     fn send_append_entries(
         peers: &[RaftClient],
@@ -454,14 +437,7 @@ impl Raft {
                             last_log_index: self.state.last_applied.load(Ordering::SeqCst),
                             last_log_term,
                         };
-                        // send
-                        let mut teller = vec![];
-                        for server_index in 0..self.peers.len() {
-                            if server_index == self.me {
-                                continue;
-                            }
-                            teller.push(self.send_request_vote(server_index, &request_vote_args));
-                        }
+                        debug!("{} going to send vote request", self.me);
 
                         //copy variables
                         let majority = self.majority;
@@ -471,11 +447,16 @@ impl Raft {
                         let server_state_lock_ = server_state_lock.clone();
                         let need_send_heartbeat_to_move = need_send_heartbeat.clone();
                         let state = self.get_state();
+                        let peers_tomove = self.peers.clone();
 
-                        // listener future
+                        // sending & waiting future
                         let result = async move {
-                            let listener =
-                                utils::wait_vote_req_reply(teller, majority, candidate_term);
+                            let listener = utils::wait_vote_req_reply(
+                                peers_tomove,
+                                request_vote_args,
+                                majority,
+                                candidate_term,
+                            );
                             let result = timeout(
                                 Duration::from_millis(election_timeout_tomove as u64),
                                 listener,
