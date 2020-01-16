@@ -213,7 +213,8 @@ enum ServerStates {
 #[derive(PartialEq)]
 pub enum IncomingRpcType {
     AppendEntries,
-    RequestVote(u64),
+    // incomming term, reset timer
+    RequestVote(u64, bool),
     TurnToFollower(u64),
     Stop,
 }
@@ -663,7 +664,6 @@ impl Raft {
                 self_last_log_term,
                 is_up_to_date);
 
-            tx.send(IncomingRpcType::RequestVote(term)).unwrap_or_default();
             if ((state.term() == term
                 && (voted_for.is_none() || *voted_for.as_ref().unwrap() == candidate_id))
                 || state.term() < term)
@@ -675,12 +675,14 @@ impl Raft {
                 // if state.term() < term {
                 //     tx.send(IncomingRpcType::TurnToFollower(term)).unwrap_or_default();
                 // }
+                tx.send(IncomingRpcType::RequestVote(term,true)).unwrap_or_default();
                 debug!("{}\tgrant", me);
                 return Box::new(futures::future::result(Ok(RequestVoteReply {
                     term:state.term(),
                     vote_granted: true,
                 })));
             }
+            tx.send(IncomingRpcType::RequestVote(term,false)).unwrap_or_default();
             debug!("{}\tnot grant", me);
             Box::new(futures::future::result(Ok(RequestVoteReply {
                 term:state.term(),
@@ -813,7 +815,7 @@ impl Raft {
                 IncomingRpcType::Stop => {
                     *killed = true;
                 }
-                IncomingRpcType::RequestVote(incoming_term) => {
+                IncomingRpcType::RequestVote(incoming_term, reset_timer) => {
                     if !self.is_leader() {
                         let mut server_state = server_state_lock.lock().unwrap();
                         *server_state = ServerStates::Follower;
@@ -822,6 +824,9 @@ impl Raft {
                         self.state
                             .current_term
                             .fetch_max(incoming_term, Ordering::SeqCst);
+                        if reset_timer {
+                            *clock = 0;
+                        }
                     }
                 }
                 IncomingRpcType::TurnToFollower(incoming_term) => {
@@ -840,11 +845,13 @@ impl Raft {
                     self.state
                         .current_term
                         .fetch_max(incoming_term, Ordering::SeqCst);
+                    *clock = 0;
                 }
                 // AppendEntries only need reset timer
-                _ => {}
+                IncomingRpcType::AppendEntries => {
+                    *clock = 0;
+                }
             }
-            *clock = 0;
         }
     }
 }
