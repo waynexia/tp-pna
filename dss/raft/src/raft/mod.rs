@@ -716,18 +716,37 @@ impl Raft {
                 tx.send(IncomingRpcType::TurnToFollower(args.term))
                     .unwrap_or_default();
                 state.current_term.store(args.term, Ordering::SeqCst);
+
+                // get "prev" log's index and term, to compare with leader's
                 let prev_log_term = state.get_log_term_by_index(args.prev_log_index);
+                let mut prev_log_index = args.prev_log_index;
+                // if going to overwrite logs in previous term
+                // every logs in that term should be replace at same tiem
+                // following `if` is going to get the first log of term `prev_log_term`
+                // to compare with leader's
+                if args.prev_log_term != prev_log_term {
+                    while prev_log_index > 1
+                        && state.get_log_term_by_index(prev_log_index - 1) == prev_log_term
+                    {
+                        prev_log_index -= 1;
+                    }
+                }
                 debug!(
                     "{} : arg.prev_index: {}, term: {}, self.prev_index: {}, term: {}",
                     me,
                     args.prev_log_index,
                     args.prev_log_term,
-                    state.last_applied.load(Ordering::SeqCst),
-                    prev_log_term
+                    // state.last_applied.load(Ordering::SeqCst),
+                    prev_log_index,
+                    prev_log_term,
                 );
+
                 // return error to let leader decrease "next_index"
                 if args.prev_log_index > state.last_applied.load(Ordering::SeqCst)
-                    || (args.prev_log_term != prev_log_term && prev_log_term != 0)
+                    || ((args.prev_log_term != prev_log_term
+                        || args.prev_log_index != prev_log_index // if going to overwrite logs in previous term,
+                            && args.prev_log_term != state.term()) // every logs in that term should be replace at same tiem
+                        && prev_log_term != 0)
                 {
                     debug!("{} reject append entries rpc", me);
                     // return (state.term(), false);
