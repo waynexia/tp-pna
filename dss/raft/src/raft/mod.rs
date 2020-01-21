@@ -73,7 +73,7 @@ impl State {
     pub fn reinit_next_index(&self) {
         let mut next_index = self.next_index.lock().unwrap();
         for index in &mut *next_index {
-            *index = self.commit_index.load(Ordering::SeqCst);
+            *index = self.get_log().len() as u64;
         }
     }
 
@@ -154,6 +154,8 @@ impl State {
             let mut next_index = self.next_index.lock().unwrap();
             if accept {
                 next_index[index] = self.get_log().len() as u64;
+            } else if self.get_log().len() as u64 == next_index[index] {
+                next_index[index] -= 1;
             } else {
                 let mut this_term = self.get_log_term_by_index(next_index[index]);
                 let mut prev_term_index = next_index[index];
@@ -463,6 +465,12 @@ impl Raft {
                         || need_send_heartbeat.load(Ordering::SeqCst)
                     {
                         need_send_heartbeat.store(false, Ordering::SeqCst);
+                        if !self.state.is_leader() {
+                            let mut server_state = server_state_lock.lock().unwrap();
+                            *server_state = ServerStates::Follower;
+                            drop(server_state);
+                            continue;
+                        }
                         // send append entries (heartbeat) rpc
                         let term = self.get_term();
                         let leader_id = self.me;
@@ -684,6 +692,8 @@ impl Raft {
                 || state.term() < term)
                 && is_up_to_date
             {
+                state.is_leader.store(false,Ordering::SeqCst);
+                state.current_term.fetch_max(term,Ordering::SeqCst);
                 // will grant
                 *voted_for = Some(candidate_id);
                 // leader step down
@@ -697,6 +707,8 @@ impl Raft {
                     vote_granted: true,
                 })));
             }
+            state.is_leader.store(false,Ordering::SeqCst);
+            state.current_term.fetch_max(term,Ordering::SeqCst);
             tx.send(IncomingRpcType::RequestVote(term,false)).unwrap_or_default();
             debug!("{}\tnot grant", me);
             Box::new(futures::future::result(Ok(RequestVoteReply {
@@ -731,22 +743,23 @@ impl Raft {
             if args.term >= state.current_term.load(Ordering::SeqCst) {
                 tx.send(IncomingRpcType::TurnToFollower(args.term))
                     .unwrap_or_default();
+                state.is_leader.store(false, Ordering::SeqCst);
                 state.current_term.store(args.term, Ordering::SeqCst);
 
                 // get "prev" log's index and term, to compare with leader's
                 let prev_log_term = state.get_log_term_by_index(args.prev_log_index);
-                let mut prev_log_index = args.prev_log_index;
+                let prev_log_index = args.prev_log_index;
                 // if going to overwrite logs in previous term
                 // every logs in that term should be replace at same tiem
                 // following `if` is going to get the first log of term `prev_log_term`
                 // to compare with leader's
-                if args.prev_log_term != prev_log_term {
-                    while prev_log_index > 1
-                        && state.get_log_term_by_index(prev_log_index - 1) == prev_log_term
-                    {
-                        prev_log_index -= 1;
-                    }
-                }
+                // if args.prev_log_term != prev_log_term {
+                //     while prev_log_index > 1
+                //         && state.get_log_term_by_index(prev_log_index - 1) == prev_log_term
+                //     {
+                //         prev_log_index -= 1;
+                //     }
+                // }
                 debug!(
                     "{} : arg.prev_index: {}, term: {}, self.prev_index: {}, term: {}",
                     me,
@@ -758,12 +771,12 @@ impl Raft {
                 );
 
                 // return error to let leader decrease "next_index"
-                if args.prev_log_index > state.get_log().len() as u64 // +1?
-                    || ((args.prev_log_term != prev_log_term
-                        || args.prev_log_index != prev_log_index // if going to overwrite logs in previous term,
-                            && args.prev_log_term != state.term()) // every logs in that term should be replace at same tiem
-                        && prev_log_term != 0)
-                {
+                // || ((args.prev_log_term != prev_log_term
+                //     || args.prev_log_index != prev_log_index // if going to overwrite logs in previous term,
+                //         && args.prev_log_term != state.term()) // every logs in that term should be replace at same tiem
+                //     && prev_log_term != 0)
+                let mut log = state.log.lock().unwrap();
+                if args.prev_log_index > log.len() as u64 || args.prev_log_term != prev_log_term {
                     debug!("{} reject append entries rpc", me);
                     // return (state.term(), false);
                     return Box::new(futures::future::result(Ok(AppendEntriesReply {
@@ -774,15 +787,15 @@ impl Raft {
                 }
                 // if this rpc contains some entries that already exist in follower's log, follower's log
                 // will be truncate first in following block, then write entries contained in rpc into follower's log
-                else if args.prev_log_index < state.get_log().len() as u64 {
-                    let mut log = state.log.lock().unwrap();
+                else {
+                    // else if args.prev_log_index < state.get_log().len() as u64 {
                     log.truncate(args.prev_log_index as usize);
                     // state
                     //     .commit_index
                     //     .store(args.prev_log_index, Ordering::SeqCst);
                 }
                 // write entries from rpc into follower's log
-                let mut log = state.log.lock().unwrap();
+                // let mut log = state.log.lock().unwrap();
                 for entry_index in 0..args.entries.len() {
                     log.push((
                         args.entries[entry_index].clone(),
