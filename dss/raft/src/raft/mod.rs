@@ -89,8 +89,8 @@ impl State {
         self.log.lock().unwrap().to_vec()
     }
 
-    pub fn get_log_term_by_index(&self, index: u64) -> u64 {
-        let log = self.get_log();
+    pub fn get_log_term_by_index(&self, index: u64, log: &[(Vec<u8>, u64)]) -> u64 {
+        // let log = self.get_log();
         if log.len() as u64 >= index && index != 0 {
             log[index as usize - 1].1
         } else {
@@ -149,26 +149,26 @@ impl State {
         debug!("persisted!");
     }
 
-    pub fn adjust_next_index(&self, feedback: Vec<(usize, bool)>) {
+    pub fn adjust_next_index(&self, feedback: Vec<(usize, bool)>, log: &[(Vec<u8>, u64)]) {
         for (index, accept) in feedback {
             let mut next_index = self.next_index.lock().unwrap();
             if accept {
-                next_index[index] = self.get_log().len() as u64;
-            } else if self.get_log().len() as u64 == next_index[index] {
+                next_index[index] = log.len() as u64;
+            } else if log.len() as u64 == next_index[index] {
                 next_index[index] -= 1;
             } else {
-                let mut this_term = self.get_log_term_by_index(next_index[index]);
+                let mut this_term = self.get_log_term_by_index(next_index[index], log);
                 let mut prev_term_index = next_index[index];
                 // reach last log of prev term
                 while prev_term_index > 0
-                    && self.get_log_term_by_index(prev_term_index) == this_term
+                    && self.get_log_term_by_index(prev_term_index, log) == this_term
                 {
                     prev_term_index -= 1;
                 }
-                this_term = self.get_log_term_by_index(prev_term_index);
+                this_term = self.get_log_term_by_index(prev_term_index, log);
                 // get to the first log in this term
                 while prev_term_index > 0
-                    && self.get_log_term_by_index(prev_term_index - 1) == this_term
+                    && self.get_log_term_by_index(prev_term_index - 1, log) == this_term
                 {
                     prev_term_index -= 1;
                 }
@@ -283,9 +283,9 @@ impl Raft {
         self.state.term()
     }
 
-    pub fn get_log(&self) -> Vec<(Vec<u8>, u64)> {
-        self.state.log.lock().unwrap().to_vec()
-    }
+    // pub fn get_log(&self) -> Vec<(Vec<u8>, u64)> {
+    //     self.state.log.lock().unwrap().to_vec()
+    // }
 
     /// restore previously persisted state.
     fn restore(&self, data: &[u8]) {
@@ -397,13 +397,13 @@ impl Raft {
                         *voted_for = Some(self.me as u64);
                         drop(voted_for);
                         // construct rpc
-                        let last_log_term =
-                            self.get_log().as_slice().last().unwrap_or(&(vec![], 0)).1;
+                        let log = self.state.get_log();
+                        let last_log_term = log.as_slice().last().unwrap_or(&(vec![], 0)).1;
                         let request_vote_args = RequestVoteArgs {
                             term: self.get_term(),
                             candidate_id: self.me as u64,
                             // last_log_index: self.state.last_applied.load(Ordering::SeqCst),
-                            last_log_index: self.state.get_log().len() as u64,
+                            last_log_index: log.len() as u64,
                             last_log_term,
                         };
                         debug!("{} going to send vote request", self.me);
@@ -480,7 +480,7 @@ impl Raft {
                         let next_index = self.state.get_next_index();
                         // let mut follower_tx = vec![];
                         let leader_commit = self.state.commit_index.load(Ordering::SeqCst);
-                        let log = self.get_log();
+                        let log = self.state.get_log();
                         let last_log_index_to_send = log.len() as u64;
                         self.state.persist(self.persister.clone());
                         // let log_length = log.len();
@@ -507,7 +507,8 @@ impl Raft {
 
                             // construct entry list by `next_index` for every single peer
                             let prev_log_index = next_index[index];
-                            let prev_log_term = self.get_log_term_by_index(prev_log_index);
+                            let prev_log_term =
+                                self.state.get_log_term_by_index(prev_log_index, &log);
                             let entries_to_send = if last_log_index_to_send > 0 {
                                 log[next_index[index] as usize..last_log_index_to_send as usize]
                                     .iter()
@@ -553,11 +554,12 @@ impl Raft {
                             .await;
                             // adjust `nextIndex`
                             debug!("feedback: {:?}", feedback);
-                            state.adjust_next_index(feedback);
+                            state.adjust_next_index(feedback, &log);
                             debug!("{} received result: {}", me, success);
                             if success {
                                 // apply log into apply_ch if log in this term is existing in majority (committed)
-                                let log = state.get_log();
+
+                                // let log = state.get_log();
                                 // let mut have_new_commit = false;
                                 // new log is committed
                                 // let have_new_commit = last_log_index_to_send
@@ -569,7 +571,7 @@ impl Raft {
                                 //     state.persist(persister);
                                 // }
                                 // if the newest log is in this term
-                                if state.get_log_term_by_index(last_log_index_to_send)
+                                if state.get_log_term_by_index(last_log_index_to_send, &log)
                                     == state.term()
                                 {
                                     for command_index in state.last_applied.load(Ordering::SeqCst)
@@ -647,14 +649,14 @@ impl Raft {
     }
 
     // the first log's index is 1
-    fn get_log_term_by_index(&self, index: u64) -> u64 {
-        let log = self.get_log();
-        if log.len() as u64 >= index && index != 0 {
-            log[index as usize - 1].1
-        } else {
-            0
-        }
-    }
+    // fn get_log_term_by_index(&self, index: u64) -> u64 {
+    //     let log = self.get_log();
+    //     if log.len() as u64 >= index && index != 0 {
+    //         log[index as usize - 1].1
+    //     } else {
+    //         0
+    //     }
+    // }
 
     /// try to vote for a candidate. If success, set state and return true, else return false
     pub fn vote_for(
@@ -672,16 +674,17 @@ impl Raft {
 
             // first look at term, if the same then look at `voted_for`, otherwise need not.
             // after that look at index
-            let self_last_log_term = state.get_log().as_slice().last().unwrap_or(&(vec![], 0)).1;
+            let log = state.get_log();
+            let self_last_log_term = log.as_slice().last().unwrap_or(&(vec![], 0)).1;
             let is_up_to_date = self_last_log_term < last_log_term // up to date
                             || (self_last_log_term == last_log_term
-                                && state.get_log().len() as u64 <= last_log_index);
+                                && log.len() as u64 <= last_log_index);
             debug!("self: {} (voted for:{:?}) received a vote request, candidate is {}, last log index is {}, own is {}  term is {}, own is {}, last log term is {}, its own is {}, up to date: {}",
                 me,
                 voted_for,candidate_id,
                 last_log_index,
                 // state.last_applied.load(Ordering::SeqCst),
-                state.get_log().len(),
+                log.len(),
                 term, state.term(),
                 last_log_term,
                 self_last_log_term,
@@ -707,6 +710,7 @@ impl Raft {
                     vote_granted: true,
                 })));
             }
+            drop(voted_for);
             state.is_leader.store(false,Ordering::SeqCst);
             state.current_term.fetch_max(term,Ordering::SeqCst);
             tx.send(IncomingRpcType::RequestVote(term,false)).unwrap_or_default();
@@ -730,12 +734,13 @@ impl Raft {
         let me = self.me as u64;
         let persister = self.persister.clone();
         let apply_ch = self.apply_ch.clone();
+        let log = state.get_log();
 
         let future = futures::future::result(Ok(true)).and_then(move |_| {
             debug!(
                 "No. {} (last log: {}, term: {}) received {:?}",
                 me,
-                state.get_log().len(),
+                log.len(),
                 state.term(),
                 args
             );
@@ -747,7 +752,7 @@ impl Raft {
                 state.current_term.store(args.term, Ordering::SeqCst);
 
                 // get "prev" log's index and term, to compare with leader's
-                let prev_log_term = state.get_log_term_by_index(args.prev_log_index);
+                let prev_log_term = state.get_log_term_by_index(args.prev_log_index, &log);
                 let prev_log_index = args.prev_log_index;
                 // if going to overwrite logs in previous term
                 // every logs in that term should be replace at same tiem
@@ -775,6 +780,7 @@ impl Raft {
                 //     || args.prev_log_index != prev_log_index // if going to overwrite logs in previous term,
                 //         && args.prev_log_term != state.term()) // every logs in that term should be replace at same tiem
                 //     && prev_log_term != 0)
+                drop(log);
                 let mut log = state.log.lock().unwrap();
                 if args.prev_log_index > log.len() as u64 || args.prev_log_term != prev_log_term {
                     debug!("{} reject append entries rpc", me);
@@ -813,7 +819,7 @@ impl Raft {
                 }
                 let log = state.get_log();
                 let commit_index = args.leader_commit;
-                if state.get_log_term_by_index(commit_index) == state.term() {
+                if state.get_log_term_by_index(commit_index, &log) == state.term() {
                     for log_index in state.last_applied.load(Ordering::SeqCst)..commit_index {
                         debug!(
                             "follower {} will apply {:?} with index {}",
