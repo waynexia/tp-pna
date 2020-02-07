@@ -166,9 +166,9 @@ impl State {
                     prev_term_index -= 1;
                 }
                 this_term = self.get_log_term_by_index(prev_term_index, log);
-                // get to the first log in this term
+                // get the first log index in this term, set next_index to (it - 1)
                 while prev_term_index > 0
-                    && self.get_log_term_by_index(prev_term_index - 1, log) == this_term
+                    && self.get_log_term_by_index(prev_term_index, log) == this_term
                 {
                     prev_term_index -= 1;
                 }
@@ -412,7 +412,7 @@ impl Raft {
                         let majority = self.majority;
                         let candidate_term = self.state.current_term.load(Ordering::SeqCst);
                         let election_timeout_tomove = election_timeout;
-                        let voted_for_lock = self.state.voted_for.clone();
+                        // let voted_for_lock = self.state.voted_for.clone();
                         let server_state_lock_ = server_state_lock.clone();
                         let need_send_heartbeat_to_move = need_send_heartbeat.clone();
                         let state = self.get_state();
@@ -433,9 +433,9 @@ impl Raft {
                             .await;
                             if let Ok((success, term)) = result {
                                 if success {
-                                    let mut voted_for = voted_for_lock.lock().unwrap();
-                                    *voted_for = None;
-                                    drop(voted_for);
+                                    // let mut voted_for = voted_for_lock.lock().unwrap();
+                                    // *voted_for = None;
+                                    // drop(voted_for);
                                     let mut server_state = server_state_lock_.lock().unwrap();
                                     *server_state = ServerStates::Leader;
                                     drop(server_state);
@@ -670,8 +670,6 @@ impl Raft {
         let tx = self.tx.clone();
         let me = self.me;
         let future = futures::future::result(Ok(true)).and_then(move |_| {
-            let mut voted_for = state.voted_for.lock().unwrap();
-
             // first look at term, if the same then look at `voted_for`, otherwise need not.
             // after that look at index
             let log = state.get_log();
@@ -679,6 +677,7 @@ impl Raft {
             let is_up_to_date = self_last_log_term < last_log_term // up to date
                             || (self_last_log_term == last_log_term
                                 && log.len() as u64 <= last_log_index);
+            let mut voted_for = state.voted_for.lock().unwrap();
             debug!("self: {} (voted for:{:?}) received a vote request, candidate is {}, last log index is {}, own is {}  term is {}, own is {}, last log term is {}, its own is {}, up to date: {}",
                 me,
                 voted_for,candidate_id,
@@ -887,21 +886,27 @@ impl Raft {
                     }
                 }
                 IncomingRpcType::TurnToFollower(incoming_term) => {
-                    let mut server_state = server_state_lock.lock().unwrap();
-                    *server_state = ServerStates::Follower;
-                    drop(server_state);
+                    // let mut server_state = server_state_lock.lock().unwrap();
+                    // *server_state = ServerStates::Follower;
+                    // drop(server_state);
                     // debug!(
                     //     "leader {}, term: {} will turn to follower",
                     //     self.me,
                     //     self.get_term()
                     // );
-                    let mut voted_for = self.state.voted_for.lock().unwrap();
-                    *voted_for = None;
-                    drop(voted_for);
                     self.state.is_leader.store(false, Ordering::SeqCst);
-                    self.state
+                    // if is a new term, set vote_for to None.
+                    if self
+                        .state
                         .current_term
-                        .fetch_max(incoming_term, Ordering::SeqCst);
+                        .fetch_max(incoming_term, Ordering::SeqCst)
+                        .max(incoming_term)
+                        == incoming_term
+                    {
+                        let mut voted_for = self.state.voted_for.lock().unwrap();
+                        *voted_for = None;
+                        drop(voted_for);
+                    }
                     *clock = 0;
                 }
                 // AppendEntries only need reset timer
