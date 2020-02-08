@@ -1,8 +1,6 @@
-// use core::future::Future as FutureStd;
 use std::time::{Duration, Instant as InstantStd};
 
 use futures::Future;
-// use futures03::channel::oneshot::Canceled;
 use futures03::channel::oneshot::{channel as oneshot, Receiver};
 use futures03::future::{select_all, FutureExt};
 use tokio02::time::{timeout_at, Instant};
