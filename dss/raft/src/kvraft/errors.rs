@@ -4,6 +4,8 @@ use std::{error, fmt, result};
 pub enum Error {
     Rpc(labrpc::Error),
     NoLeader,
+    Timeout,
+    Others,
 }
 
 impl fmt::Display for Error {
@@ -15,8 +17,10 @@ impl fmt::Display for Error {
 impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match *self {
-            Error::NoLeader => None,
             Error::Rpc(ref e) => Some(e),
+            Error::NoLeader => None,
+            Error::Timeout => None,
+            Error::Others => None,
         }
     }
 }

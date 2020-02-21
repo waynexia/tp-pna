@@ -4,7 +4,7 @@ use crate::raft::{self};
 // use crossbeam::channel::{unbounded as Cunbounded, Receiver as CReceiver, Sender as CSender};
 use futures::sync::mpsc::unbounded;
 use futures::sync::oneshot;
-use futures::sync::oneshot::Sender as OSender;
+// use futures::sync::oneshot::Sender as OSender;
 use futures::{Future, Stream};
 use labrpc::{Error as LError, RpcFuture};
 use rand::Rng;
@@ -17,25 +17,35 @@ use std::time::Duration;
 // use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 // use tokio::prelude::*;
 use tokio::runtime::Runtime;
+use tokio02::runtime::Runtime as tokio02_Runtime;
+use tokio02::sync::oneshot::{
+    channel as tokio_oneshot, Receiver as TOReceiver, Sender as TOSender,
+};
 
 use super::errors::*;
 
+use crate::raft::ApplyMsg;
+
+const MAX_RESEND_COUNT: u64 = 10;
+const TIMEOUT_INTERVAL: u64 = 100; // in ms
+
 pub struct KvServer {
     pub rf: raft::Node,
+    // peer number
     me: usize,
-    // snapshot if log grows this big
+    // snapshot indicator
     maxraftstate: Option<usize>,
-    _state_machine: Arc<Mutex<HashMap<String, String>>>,
-    dup_cmd: Arc<Mutex<HashMap<u64, OSender<ApplyResult>>>>,
-    // Your definitions here.
-    // apply_ch: Arc<UnboundedReceiver<ApplyMsg>>,
-    // committed_tx: CSender<ApplyResult>,
-    // committed_rx: CReceiver<ApplyResult>,
+
+    _storage: Arc<Mutex<HashMap<String, String>>>,
+    // buffer reply channel. <(term, exec_index), tx>
+    pub reply_buffer: Arc<Mutex<HashMap<(u64, u64), TOSender<ApplyResult>>>>,
+    // buffer unordered commands
+    pub command_buffer: Arc<Mutex<HashMap<(u64, u64), Command>>>,
+    term: Arc<AtomicU64>,
+    // the number of last executed command
+    pub curr_exec_idx: Arc<AtomicU64>,
+    pub curr_recv_idx: Arc<AtomicU64>,
     _rt: Runtime,
-    // token for received command
-    rcv_token: Arc<AtomicU64>,
-    // token for applied command
-    _apl_token: Arc<AtomicU64>,
 }
 
 impl KvServer {
@@ -45,142 +55,40 @@ impl KvServer {
         persister: Box<dyn raft::persister::Persister>,
         maxraftstate: Option<usize>,
     ) -> KvServer {
-        // You may need initialization code here.
-
         let (tx, apply_ch) = unbounded();
-        // let (tx, apply_ch) = unbounded_channel();
-        // let (committed_tx, committed_rx) = Cunbounded();
         let raft = raft::Raft::new(servers, me, persister, tx.clone());
         let node = raft::Node::new(raft);
 
-        let state_machine = Arc::new(Mutex::new(HashMap::new()));
-        let s = state_machine.clone();
-        let dup_cmd: Arc<Mutex<HashMap<u64, OSender<ApplyResult>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let apl_token = Arc::new(AtomicU64::new(0));
-        let d = dup_cmd.clone();
+        let storage = Arc::new(Mutex::new(HashMap::new()));
+        let reply_buffer = Arc::new(Mutex::new(HashMap::new()));
+        let command_buffer = Arc::new(Mutex::new(HashMap::new()));
+        let curr_exec_idx = Arc::new(AtomicU64::new(0));
+        let term = Arc::new(AtomicU64::new(0));
 
-        // let tx = committed_tx.clone();
-        let re_apply_tx = tx;
-        let apl_token_for_capture = apl_token.clone();
-        // let me_ = me.clone();
-        let apply = apply_ch
-            .for_each(move |cmd| {
-                // let sth_s = s.lock().unwrap();
-                // drop(sth_s);
-                if !cmd.command_valid {
-                    return Ok(());
-                }
-                match labcodec::decode::<Command>(&cmd.command) {
-                    Ok(command) => {
-                        // lock and access HasmMap
-                        let apply_token = apl_token_for_capture.load(Ordering::SeqCst);
-                        // a legal command but need to be applied later
-                        if command.token > apply_token + 1 {
-                            debug!(
-                                "me :{}, skiped apply token {}, send into re-apply",
-                                me, apply_token
-                            );
-                            re_apply_tx
-                                .unbounded_send(cmd)
-                                .expect("failed to re-send apply message");
-                            return Ok(());
-                        } else {
-                            debug!("me :{}, apply token {}", me, apply_token);
-                            apl_token_for_capture.store(
-                                apl_token_for_capture.load(Ordering::SeqCst) + 1,
-                                Ordering::SeqCst,
-                            );
-                        }
+        // let re_apply_tx = tx;
+        let term_tomove = term.clone();
+        let curr_exec_idx_tomove = curr_exec_idx.clone();
+        let storage_tomove = storage.clone();
+        let reply_buffer_tomove = reply_buffer.clone();
+        let command_buffer_tomove = command_buffer.clone();
+        let apply = apply_ch.for_each(move |cmd| {
+            let term = term_tomove.clone();
+            let curr_exec_idx = curr_exec_idx_tomove.clone();
+            let storage = storage_tomove.clone();
+            let reply_buffer = reply_buffer_tomove.clone();
+            let command_buffer = command_buffer_tomove.clone();
+            KvServer::execute_command(
+                term,
+                cmd,
+                curr_exec_idx,
+                storage,
+                reply_buffer,
+                command_buffer,
+            )
+            .unwrap_or_default();
+            Ok(())
+        });
 
-                        let mut storage = s.lock().unwrap();
-                        let mut dup_cmd = d.lock().unwrap();
-                        match command.command_type {
-                            // Put
-                            1 => {
-                                // this command is executed before
-                                if dup_cmd.contains_key(&command.token) {
-                                    let key = command.key.clone();
-                                    let value = command.value.clone().unwrap();
-                                    let tx = dup_cmd.remove(&command.token).unwrap();
-                                    storage.remove(&key);
-                                    storage.insert(key, value);
-                                    // dup_cmd.insert(command.token, "".to_owned());
-
-                                    tx.send(ApplyResult {
-                                        command_type: 1,
-                                        success: true,
-                                        wrong_leader: false,
-                                        err: None,
-                                        value: None,
-                                    })
-                                    .unwrap();
-                                }
-                            }
-                            // Append
-                            2 => {
-                                if dup_cmd.contains_key(&command.token) {
-                                    let key = command.key.clone();
-                                    let value = command.value.clone().unwrap();
-                                    let prev_value =
-                                        storage.get(&key).map(|s| s.to_owned()).unwrap_or_default();
-                                    let new_value = format!("{}{}", prev_value, value);
-                                    storage.insert(key, new_value);
-                                    let tx = dup_cmd.remove(&command.token).unwrap();
-                                    // dup_cmd.insert(command.token, "".to_owned());
-
-                                    tx.send(ApplyResult {
-                                        command_type: 2,
-                                        success: true,
-                                        wrong_leader: false,
-                                        err: None,
-                                        value: None,
-                                    })
-                                    .unwrap();
-                                }
-                            }
-                            // Get
-                            3 => {
-                                if dup_cmd.contains_key(&command.token) {
-                                    let key = command.key.clone();
-                                    let tx = dup_cmd.remove(&command.token).unwrap();
-                                    if !storage.contains_key(&key) {
-                                        // dup_cmd.insert(command.token, "".to_owned());
-                                        tx.send(ApplyResult {
-                                            command_type: 3,
-                                            success: true,
-                                            wrong_leader: false,
-                                            err: Some("key does not exist".to_owned()),
-                                            value: Some("".to_owned()),
-                                        })
-                                        .unwrap();
-                                    } else {
-                                        let value = storage.get(&key).unwrap().to_owned();
-                                        // dup_cmd.insert(command.token, value.clone());
-                                        tx.send(ApplyResult {
-                                            command_type: 3,
-                                            success: true,
-                                            wrong_leader: false,
-                                            err: None,
-                                            value: Some(value),
-                                        })
-                                        .unwrap();
-                                    }
-                                }
-                            }
-                            _ => unreachable!(),
-                        }
-                    }
-                    Err(e) => {
-                        debug!("decode error : {:?}", e);
-                    }
-                }
-                Ok(())
-            })
-            .map_err(move |_| debug!("some error"));
-        // thread::spawn(move || {
-        //     let _ = apply.wait();
-        // });
         let rt = Runtime::new().unwrap();
         rt.executor().spawn(apply);
 
@@ -188,100 +96,171 @@ impl KvServer {
             rf: node,
             me,
             maxraftstate,
-            _state_machine: state_machine,
-            dup_cmd,
-            // committed_tx,
-            // committed_rx,
-            // apply_ch,
+            _storage: storage,
+            reply_buffer,
+            command_buffer,
+            term,
+            curr_exec_idx,
+            curr_recv_idx: Arc::new(AtomicU64::new(0)),
             _rt: rt,
-            rcv_token: Arc::new(AtomicU64::new(0)),
-            _apl_token: apl_token,
         }
+    }
+
+    pub fn execute_command(
+        term: Arc<AtomicU64>,
+        cmd: ApplyMsg,
+        curr_exec_idx: Arc<AtomicU64>,
+        storage: Arc<Mutex<HashMap<String, String>>>,
+        reply_buffer_lock: Arc<Mutex<HashMap<(u64, u64), TOSender<ApplyResult>>>>,
+        command_buffer_lock: Arc<Mutex<HashMap<(u64, u64), Command>>>,
+    ) -> Result<()> {
+        if !cmd.command_valid {
+            return Ok(());
+        }
+        match labcodec::decode::<Command>(&cmd.command) {
+            Ok(command) => {
+                // compare execute_index
+                if command.token < curr_exec_idx.load(Ordering::SeqCst) {
+                    // executed, ignore
+                } else if command.token == curr_exec_idx.load(Ordering::SeqCst) {
+                    // execute, reply, check next index in buffer
+                    let mut should_continue = true;
+                    while should_continue {
+                        let mut err = None;
+                        let mut value = None;
+                        // get reply channel
+                        let mut reply_buffer = reply_buffer_lock.lock().unwrap();
+                        let reply_ch = reply_buffer
+                            .remove(&(term.load(Ordering::SeqCst), command.token))
+                            .unwrap();
+                        drop(reply_buffer);
+
+                        // execute command
+                        let mut storage = storage.lock().unwrap();
+                        match command.command_type {
+                            // Put
+                            1 => {
+                                storage.remove(&command.key);
+                                storage.insert(command.key.clone(), command.value.clone().unwrap());
+                            }
+                            // Append
+                            2 => {
+                                // let key = command.key.clone();
+                                // let value = command.value.clone().unwrap();
+                                let prev_value = storage
+                                    .get(&command.key)
+                                    .map(|s| s.to_owned())
+                                    .unwrap_or_default();
+                                let new_value =
+                                    format!("{}{}", prev_value, command.value.clone().unwrap());
+                                storage.insert(command.key.clone(), new_value);
+                            }
+                            // Get
+                            3 => {
+                                if !storage.contains_key(&command.key) {
+                                    err = Some("key does not exist".to_owned());
+                                    value = Some("".to_owned());
+                                } else {
+                                    value = Some(storage.get(&command.key).unwrap().to_owned());
+                                }
+                            }
+                            _ => unreachable!(),
+                        }
+                        reply_ch
+                            .send(ApplyResult {
+                                command_type: command.command_type,
+                                success: true,
+                                wrong_leader: false,
+                                err,
+                                value,
+                            })
+                            .unwrap_or_default();
+
+                        // consider next command in buffer
+                        curr_exec_idx.fetch_add(1, Ordering::SeqCst);
+                        let reply_buffer = reply_buffer_lock.lock().unwrap();
+                        let command_buffer = command_buffer_lock.lock().unwrap();
+                        should_continue = reply_buffer.contains_key(&(
+                            term.load(Ordering::SeqCst),
+                            curr_exec_idx.load(Ordering::SeqCst),
+                        )) && command_buffer.contains_key(&(
+                            term.load(Ordering::SeqCst),
+                            curr_exec_idx.load(Ordering::SeqCst),
+                        ));
+                    }
+                } else {
+                    // out of order, store command into buffer
+                    let mut command_buffer = command_buffer_lock.lock().unwrap();
+                    command_buffer.insert((term.load(Ordering::SeqCst), command.token), command);
+                    drop(command_buffer);
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                debug!("decode error: {:?}", e);
+            }
+        }
+        Ok(())
+    }
+
+    fn allc_header(&self) -> u64 {
+        self.curr_recv_idx.fetch_add(1, Ordering::SeqCst)
     }
 
     pub fn get_state(&self) -> Arc<raft::State> {
         self.rf.get_state()
     }
 
-    fn get_rcv_token_and_increase(&self) -> u64 {
-        let retval = self.rcv_token.load(Ordering::SeqCst);
-        self.rcv_token.store(retval + 1, Ordering::SeqCst);
-        retval
+    pub async fn exec_command(&self, mut args: Command) -> Result<ApplyResult> {
+        // set header
+        let idx = self.allc_header();
+        args.token = idx;
+
+        // for server to report execute result
+        let (result_tx, result_rx) = tokio_oneshot();
+        let mut reply_buffer = self.reply_buffer.lock().unwrap();
+        if reply_buffer.contains_key(&(self.term.load(Ordering::SeqCst), idx)) {
+            // todo: change error type
+            return Err(Error::Others);
+        }
+        reply_buffer.insert((self.term.load(Ordering::SeqCst), idx), result_tx);
+        drop(reply_buffer);
+        self.start_async(&args, result_rx).await
     }
 
-    // just try to start a new command to raft
-    pub fn start<M>(&self, command: &M) -> Result<()>
+    pub async fn start_async<M>(
+        &self,
+        command: &M,
+        // exec_index: u64,
+        mut result_rx: TOReceiver<ApplyResult>,
+    ) -> Result<ApplyResult>
     where
         M: labcodec::Message,
     {
         info!("start a command");
-        match self.rf.start(command) {
-            Ok((_, _)) => Ok(()),
-            Err(_) => Err(Error::NoLeader),
-        }
-    }
 
-    pub fn try_get(&self, mut args: Command, tx: OSender<ApplyResult>) {
-        let token = self.get_rcv_token_and_increase();
-        args.token = token;
-        let mut dup_cmd = self.dup_cmd.lock().unwrap();
-        dup_cmd.insert(token, tx);
-        drop(dup_cmd);
-        for resend_cnt in 0..3 {
-            if self.start(&args).is_err() || resend_cnt > 3 {
-                // info!("not leader");
-                let mut dup_cmd = self.dup_cmd.lock().unwrap();
-                let tx = dup_cmd.remove(&token).unwrap();
-                let _ = tx.send(ApplyResult {
-                    command_type: args.command_type,
-                    wrong_leader: true,
-                    success: false,
-                    err: Some("failed to reach consensuce".to_owned()),
-                    value: Some("".to_owned()),
-                });
-                return;
+        let mut timeout_cnt = 0;
+        let mut delay = tokio02::time::delay_for(Duration::from_millis(0));
+
+        loop {
+            tokio02::select! {
+                _ = &mut delay => {
+                    // timeout
+                    if timeout_cnt < MAX_RESEND_COUNT{
+                        // reset timer and resend
+                        timeout_cnt += 1;
+                        if self.rf.start(command).is_err() {
+                            return Err(Error::NoLeader);
+                        }
+                        delay = tokio02::time::delay_for(Duration::from_millis(TIMEOUT_INTERVAL));
+                    } else {
+                        return Err(Error::Timeout);
+                    }
+                }
+                result = &mut result_rx => {
+                    return result.map_err(|_| Error::Others);
+                }
             }
-            thread::sleep(Duration::from_millis(1000));
-
-            // check if applied
-            let dup_cmd = self.dup_cmd.lock().unwrap();
-            if !dup_cmd.contains_key(&token) {
-                return;
-            }
-            drop(dup_cmd);
-
-            // resend_cnt += 1;
-        }
-    }
-
-    pub fn try_put_append(&self, mut args: Command, tx: OSender<ApplyResult>) {
-        let token = self.get_rcv_token_and_increase();
-        args.token = token;
-        let mut dup_cmd = self.dup_cmd.lock().unwrap();
-        dup_cmd.insert(token, tx);
-        drop(dup_cmd);
-        for resend_cnt in 0..3 {
-            if self.start(&args).is_err() || resend_cnt > 3 {
-                // info!("not leader");
-                let mut dup_cmd = self.dup_cmd.lock().unwrap();
-                let tx = dup_cmd.remove(&token).unwrap();
-                let _ = tx.send(ApplyResult {
-                    command_type: args.command_type,
-                    wrong_leader: true,
-                    success: false,
-                    err: Some("failed to reach consensuce".to_owned()),
-                    value: Some("".to_owned()),
-                });
-                return;
-            }
-            thread::sleep(Duration::from_millis(1000));
-
-            // check if applied
-            let dup_cmd = self.dup_cmd.lock().unwrap();
-            if !dup_cmd.contains_key(&token) {
-                return;
-            }
-            drop(dup_cmd);
         }
     }
 }
@@ -359,7 +338,7 @@ impl KvService for Node {
                 value: Some("".to_owned()),
             })));
         }
-        info!("start a get");
+        info!("start a read operation");
 
         let command = Command {
             command_type: 3, // Get
@@ -368,7 +347,18 @@ impl KvService for Node {
             token: 0,
         };
         let (tx, rx) = oneshot::channel::<ApplyResult>();
-        self.server.try_get(command, tx);
+        // self.server.try_get(command, tx);
+        let server = self.server.clone();
+        // todo: use runtime.spawn()
+        thread::spawn(move || {
+            tx.send(
+                tokio02_Runtime::new()
+                    .unwrap()
+                    .block_on(server.exec_command(command))
+                    .unwrap(),
+            )
+            .unwrap_or_default();
+        });
         Box::new(rx.map_err(LError::Recv))
     }
 
@@ -384,7 +374,7 @@ impl KvService for Node {
             })));
         }
 
-        info!("start a put / append");
+        info!("start a write operation");
         let mut rng = rand::thread_rng();
         let token: u64 = rng.gen();
 
@@ -395,7 +385,17 @@ impl KvService for Node {
             token,
         };
         let (tx, rx) = oneshot::channel::<ApplyResult>();
-        self.server.try_put_append(command, tx);
+        // self.server.try_put_append(command, tx);
+        let server = self.server.clone();
+        // todo: use runtime.spawn()
+        thread::spawn(move || {
+            tx.send(
+                tokio02_Runtime::new()
+                    .unwrap()
+                    .block_on(server.exec_command(command))
+                    .unwrap(),
+            )
+        });
         Box::new(rx.map_err(LError::Recv))
     }
 }
