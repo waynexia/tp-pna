@@ -57,7 +57,7 @@ impl Clerk {
 
             if let Ok(result) = rx.recv() {
                 if let Ok(get_reply) = result {
-                    if get_reply.wrong_leader {
+                    if get_reply.wrong_leader || !get_reply.success {
                         // this one is not leader, break and roll a new one
                         continue;
                     }
@@ -92,7 +92,7 @@ impl Clerk {
 
             if let Ok(result) = rx.recv() {
                 if let Ok(put_append_reply) = result {
-                    if put_append_reply.wrong_leader {
+                    if put_append_reply.wrong_leader || !put_append_reply.success {
                         // this one is not leader, break and roll a new one
                         continue;
                     }

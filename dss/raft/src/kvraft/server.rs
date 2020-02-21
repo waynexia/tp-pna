@@ -129,6 +129,7 @@ impl KvServer {
                     }
                     std::cmp::Ordering::Equal => {
                         // execute, reply, check next index in buffer
+                        curr_exec_idx.fetch_add(1, Ordering::SeqCst);
                         let mut should_continue = true;
                         while should_continue {
                             let mut err = None;
@@ -185,13 +186,9 @@ impl KvServer {
                                     .unwrap_or_default();
                             }
                             // consider next command in buffer
-                            curr_exec_idx.fetch_add(1, Ordering::SeqCst);
-                            let reply_buffer = reply_buffer_lock.lock().unwrap();
+                            // let reply_buffer = reply_buffer_lock.lock().unwrap();
                             let command_buffer = command_buffer_lock.lock().unwrap();
-                            should_continue = reply_buffer.contains_key(&(
-                                term.load(Ordering::SeqCst),
-                                curr_exec_idx.load(Ordering::SeqCst),
-                            )) && command_buffer.contains_key(&(
+                            should_continue = command_buffer.contains_key(&(
                                 term.load(Ordering::SeqCst),
                                 curr_exec_idx.load(Ordering::SeqCst),
                             ));
@@ -222,7 +219,7 @@ impl KvServer {
         self.rf.get_state()
     }
 
-    pub async fn exec_command(&self, mut args: Command) -> Result<ApplyResult> {
+    pub async fn start_command(&self, mut args: Command) -> ApplyResult {
         // set header
         let idx = self.allc_header();
         args.token = idx;
@@ -232,14 +229,25 @@ impl KvServer {
         let mut reply_buffer = self.reply_buffer.lock().unwrap();
         if reply_buffer.contains_key(&(self.term.load(Ordering::SeqCst), idx)) {
             // todo: change error type
-            return Err(Error::Others);
+            // return Err(Error::Others);
+            unreachable!();
         }
         reply_buffer.insert((self.term.load(Ordering::SeqCst), idx), result_tx);
         drop(reply_buffer);
-        self.start_async(&args, result_rx).await
+
+        match self.start(&args, result_rx).await {
+            Ok(result) => result,
+            Err(e) => ApplyResult {
+                command_type: args.command_type,
+                wrong_leader: e == Error::NoLeader,
+                success: false,
+                err: Some(format!("{:?}", e)),
+                value: None,
+            },
+        }
     }
 
-    pub async fn start_async<M>(
+    pub async fn start<M>(
         &self,
         command: &M,
         // exec_index: u64,
@@ -365,8 +373,7 @@ impl KvService for Node {
             tx.send(
                 tokio02_Runtime::new()
                     .unwrap()
-                    .block_on(server.exec_command(command))
-                    .unwrap(),
+                    .block_on(server.start_command(command)),
             )
             .unwrap_or_default();
         });
@@ -403,8 +410,7 @@ impl KvService for Node {
             tx.send(
                 tokio02_Runtime::new()
                     .unwrap()
-                    .block_on(server.exec_command(command))
-                    .unwrap(),
+                    .block_on(server.start_command(command)),
             )
         });
         Box::new(rx.map_err(LError::Recv))
