@@ -135,9 +135,9 @@ impl KvServer {
                             let mut value = None;
                             // get reply channel
                             let mut reply_buffer = reply_buffer_lock.lock().unwrap();
-                            let reply_ch = reply_buffer
-                                .remove(&(term.load(Ordering::SeqCst), command.token))
-                                .unwrap();
+                            // follower server need not to report
+                            let reply_ch =
+                                reply_buffer.remove(&(term.load(Ordering::SeqCst), command.token));
                             drop(reply_buffer);
                             // execute command
                             let mut storage = storage.lock().unwrap();
@@ -173,15 +173,17 @@ impl KvServer {
                                 }
                                 _ => unreachable!(),
                             }
-                            reply_ch
-                                .send(ApplyResult {
-                                    command_type: command.command_type,
-                                    success: true,
-                                    wrong_leader: false,
-                                    err,
-                                    value,
-                                })
-                                .unwrap_or_default();
+                            if let Some(channel) = reply_ch {
+                                channel
+                                    .send(ApplyResult {
+                                        command_type: command.command_type,
+                                        success: true,
+                                        wrong_leader: false,
+                                        err,
+                                        value,
+                                    })
+                                    .unwrap_or_default();
+                            }
                             // consider next command in buffer
                             curr_exec_idx.fetch_add(1, Ordering::SeqCst);
                             let reply_buffer = reply_buffer_lock.lock().unwrap();
