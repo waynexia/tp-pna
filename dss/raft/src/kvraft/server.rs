@@ -29,6 +29,9 @@ use crate::raft::ApplyMsg;
 const MAX_RESEND_COUNT: u64 = 10;
 const TIMEOUT_INTERVAL: u64 = 100; // in ms
 
+type ReplyBuffer = HashMap<(u64, u64), TOSender<ApplyResult>>;
+type CommandBuffer = HashMap<(u64, u64), Command>;
+
 pub struct KvServer {
     pub rf: raft::Node,
     // peer number
@@ -38,9 +41,9 @@ pub struct KvServer {
 
     _storage: Arc<Mutex<HashMap<String, String>>>,
     // buffer reply channel. <(term, exec_index), tx>
-    pub reply_buffer: Arc<Mutex<HashMap<(u64, u64), TOSender<ApplyResult>>>>,
+    pub reply_buffer: Arc<Mutex<ReplyBuffer>>,
     // buffer unordered commands
-    pub command_buffer: Arc<Mutex<HashMap<(u64, u64), Command>>>,
+    pub command_buffer: Arc<Mutex<CommandBuffer>>,
     term: Arc<AtomicU64>,
     // the number of last executed command
     pub curr_exec_idx: Arc<AtomicU64>,
@@ -56,7 +59,7 @@ impl KvServer {
         maxraftstate: Option<usize>,
     ) -> KvServer {
         let (tx, apply_ch) = unbounded();
-        let raft = raft::Raft::new(servers, me, persister, tx.clone());
+        let raft = raft::Raft::new(servers, me, persister, tx);
         let node = raft::Node::new(raft);
 
         let storage = Arc::new(Mutex::new(HashMap::new()));
@@ -111,89 +114,95 @@ impl KvServer {
         cmd: ApplyMsg,
         curr_exec_idx: Arc<AtomicU64>,
         storage: Arc<Mutex<HashMap<String, String>>>,
-        reply_buffer_lock: Arc<Mutex<HashMap<(u64, u64), TOSender<ApplyResult>>>>,
-        command_buffer_lock: Arc<Mutex<HashMap<(u64, u64), Command>>>,
+        reply_buffer_lock: Arc<Mutex<ReplyBuffer>>,
+        command_buffer_lock: Arc<Mutex<CommandBuffer>>,
     ) -> Result<()> {
         if !cmd.command_valid {
             return Ok(());
         }
         match labcodec::decode::<Command>(&cmd.command) {
             Ok(command) => {
-                // compare execute_index
-                if command.token < curr_exec_idx.load(Ordering::SeqCst) {
-                    // executed, ignore
-                } else if command.token == curr_exec_idx.load(Ordering::SeqCst) {
-                    // execute, reply, check next index in buffer
-                    let mut should_continue = true;
-                    while should_continue {
-                        let mut err = None;
-                        let mut value = None;
-                        // get reply channel
-                        let mut reply_buffer = reply_buffer_lock.lock().unwrap();
-                        let reply_ch = reply_buffer
-                            .remove(&(term.load(Ordering::SeqCst), command.token))
-                            .unwrap();
-                        drop(reply_buffer);
-
-                        // execute command
-                        let mut storage = storage.lock().unwrap();
-                        match command.command_type {
-                            // Put
-                            1 => {
-                                storage.remove(&command.key);
-                                storage.insert(command.key.clone(), command.value.clone().unwrap());
-                            }
-                            // Append
-                            2 => {
-                                // let key = command.key.clone();
-                                // let value = command.value.clone().unwrap();
-                                let prev_value = storage
-                                    .get(&command.key)
-                                    .map(|s| s.to_owned())
-                                    .unwrap_or_default();
-                                let new_value =
-                                    format!("{}{}", prev_value, command.value.clone().unwrap());
-                                storage.insert(command.key.clone(), new_value);
-                            }
-                            // Get
-                            3 => {
-                                if !storage.contains_key(&command.key) {
-                                    err = Some("key does not exist".to_owned());
-                                    value = Some("".to_owned());
-                                } else {
-                                    value = Some(storage.get(&command.key).unwrap().to_owned());
-                                }
-                            }
-                            _ => unreachable!(),
-                        }
-                        reply_ch
-                            .send(ApplyResult {
-                                command_type: command.command_type,
-                                success: true,
-                                wrong_leader: false,
-                                err,
-                                value,
-                            })
-                            .unwrap_or_default();
-
-                        // consider next command in buffer
-                        curr_exec_idx.fetch_add(1, Ordering::SeqCst);
-                        let reply_buffer = reply_buffer_lock.lock().unwrap();
-                        let command_buffer = command_buffer_lock.lock().unwrap();
-                        should_continue = reply_buffer.contains_key(&(
-                            term.load(Ordering::SeqCst),
-                            curr_exec_idx.load(Ordering::SeqCst),
-                        )) && command_buffer.contains_key(&(
-                            term.load(Ordering::SeqCst),
-                            curr_exec_idx.load(Ordering::SeqCst),
-                        ));
+                match command.token.cmp(&curr_exec_idx.load(Ordering::SeqCst)) {
+                    std::cmp::Ordering::Less => {
+                        // executed, ignore
+                        return Ok(());
                     }
-                } else {
-                    // out of order, store command into buffer
-                    let mut command_buffer = command_buffer_lock.lock().unwrap();
-                    command_buffer.insert((term.load(Ordering::SeqCst), command.token), command);
-                    drop(command_buffer);
-                }
+                    std::cmp::Ordering::Equal => {
+                        // execute, reply, check next index in buffer
+                        let mut should_continue = true;
+                        while should_continue {
+                            let mut err = None;
+                            let mut value = None;
+                            // get reply channel
+                            let mut reply_buffer = reply_buffer_lock.lock().unwrap();
+                            let reply_ch = reply_buffer
+                                .remove(&(term.load(Ordering::SeqCst), command.token))
+                                .unwrap();
+                            drop(reply_buffer);
+                            // execute command
+                            let mut storage = storage.lock().unwrap();
+                            match command.command_type {
+                                // Put
+                                1 => {
+                                    storage.remove(&command.key);
+                                    storage.insert(
+                                        command.key.clone(),
+                                        command.value.clone().unwrap(),
+                                    );
+                                }
+                                // Append
+                                2 => {
+                                    // let key = command.key.clone();
+                                    // let value = command.value.clone().unwrap();
+                                    let prev_value = storage
+                                        .get(&command.key)
+                                        .map(|s| s.to_owned())
+                                        .unwrap_or_default();
+                                    let new_value =
+                                        format!("{}{}", prev_value, command.value.clone().unwrap());
+                                    storage.insert(command.key.clone(), new_value);
+                                }
+                                // Get
+                                3 => {
+                                    if !storage.contains_key(&command.key) {
+                                        err = Some("key does not exist".to_owned());
+                                        value = Some("".to_owned());
+                                    } else {
+                                        value = Some(storage.get(&command.key).unwrap().to_owned());
+                                    }
+                                }
+                                _ => unreachable!(),
+                            }
+                            reply_ch
+                                .send(ApplyResult {
+                                    command_type: command.command_type,
+                                    success: true,
+                                    wrong_leader: false,
+                                    err,
+                                    value,
+                                })
+                                .unwrap_or_default();
+                            // consider next command in buffer
+                            curr_exec_idx.fetch_add(1, Ordering::SeqCst);
+                            let reply_buffer = reply_buffer_lock.lock().unwrap();
+                            let command_buffer = command_buffer_lock.lock().unwrap();
+                            should_continue = reply_buffer.contains_key(&(
+                                term.load(Ordering::SeqCst),
+                                curr_exec_idx.load(Ordering::SeqCst),
+                            )) && command_buffer.contains_key(&(
+                                term.load(Ordering::SeqCst),
+                                curr_exec_idx.load(Ordering::SeqCst),
+                            ));
+                        }
+                    }
+                    std::cmp::Ordering::Greater => {
+                        // out of order, store command into buffer
+                        let mut command_buffer = command_buffer_lock.lock().unwrap();
+                        command_buffer
+                            .insert((term.load(Ordering::SeqCst), command.token), command);
+                        drop(command_buffer);
+                    }
+                };
                 return Ok(());
             }
             Err(e) => {
