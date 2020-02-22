@@ -1,6 +1,8 @@
 use rand::Rng;
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::Arc;
 // use std::thread;
 // use std::time::Duration;
 
@@ -19,7 +21,8 @@ pub struct Clerk {
     pub name: String,
     pub servers: Vec<KvClient>,
     pub num_server: usize,
-    // You will have to modify this struct.
+    // raft leader number
+    leader: Arc<AtomicUsize>,
 }
 
 impl fmt::Debug for Clerk {
@@ -36,6 +39,7 @@ impl Clerk {
             name,
             servers,
             num_server,
+            leader: Arc::default(),
         }
     }
 
@@ -50,24 +54,24 @@ impl Clerk {
         let request = GetRequest { key };
         info!("{}: {:?}", self.name, request);
 
+        let mut server_index = self.leader.load(Ordering::SeqCst);
         loop {
-            // random choose a server to send command
-            let server_index = rng.gen_range(0, self.num_server);
             let rx = self.send_get_rpc(server_index, &request);
 
             if let Ok(result) = rx.recv() {
                 if let Ok(get_reply) = result {
                     if get_reply.wrong_leader || !get_reply.success {
                         // this one is not leader, break and roll a new one
+                        server_index = rng.gen_range(0, self.num_server);
                         continue;
                     }
                     let value = get_reply.value.unwrap();
                     info!("{}: client result: `{}`", self.name, value);
 
+                    self.leader.store(server_index, Ordering::SeqCst);
                     return value;
                 }
             }
-            // thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -85,15 +89,18 @@ impl Clerk {
         };
         let request = PutAppendRequest { key, value, op };
         info!("{}: {:?}", self.name, request);
+
+        let mut server_index = self.leader.load(Ordering::SeqCst);
         loop {
             // random choose a server to send command
-            let server_index = rng.gen_range(0, self.num_server);
+            // let server_index = rng.gen_range(0, self.num_server);
             let rx = self.send_put_append_rpc(server_index, &request);
 
             if let Ok(result) = rx.recv() {
                 if let Ok(put_append_reply) = result {
                     if put_append_reply.wrong_leader || !put_append_reply.success {
                         // this one is not leader, break and roll a new one
+                        server_index = rng.gen_range(0, self.num_server);
                         continue;
                     }
                     info!("{}: client result: done {:?}", self.name, put_append_reply);
@@ -114,7 +121,7 @@ impl Clerk {
     }
 }
 
-// private util functions
+// private utility functions
 impl Clerk {
     fn send_get_rpc(
         &self,
