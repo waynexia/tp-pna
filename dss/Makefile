@@ -24,8 +24,8 @@ test_3a: cargo_test_3a
 
 test_3b: cargo_test_3b
 
-cargo_test_%: check
-	RUST_LOG=${LOG_LEVEL} cargo test -p raft -- --nocapture --test $*
+cargo_%: check
+	RUST_LOG=${LOG_LEVEL} RUST_BACKTRACE=full cargo test -p raft -- --nocapture --test $*
 
 test_others: check
 	RUST_LOG=${LOG_LEVEL} cargo test -p labrpc -p labcodec -- --nocapture

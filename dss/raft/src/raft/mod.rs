@@ -526,7 +526,7 @@ impl Raft {
                                         ..state.commit_index.load(Ordering::SeqCst)
                                     {
                                         let command = log[command_index as usize].0.clone();
-                                        debug!(
+                                        info!(
                                             "leader {} will apply {:?} with index {}",
                                             me,
                                             command,
@@ -726,7 +726,7 @@ impl Raft {
                 let commit_index = args.leader_commit;
                 if state.get_log_term_by_index(commit_index, &log) == state.term() {
                     for log_index in state.last_applied.load(Ordering::SeqCst)..commit_index {
-                        debug!(
+                        info!(
                             "follower {} will apply {:?} with index {}",
                             me,
                             log[log_index as usize],

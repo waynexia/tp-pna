@@ -48,7 +48,7 @@ impl Clerk {
     pub fn get(&self, key: String) -> String {
         let mut rng = rand::thread_rng();
         let request = GetRequest { key };
-        info!("{:?}", request);
+        info!("{}: {:?}", self.name, request);
 
         loop {
             // random choose a server to send command
@@ -62,7 +62,7 @@ impl Clerk {
                         continue;
                     }
                     let value = get_reply.value.unwrap();
-                    info!("client result: `{}`", value);
+                    info!("{}: client result: `{}`", self.name, value);
 
                     return value;
                 }
@@ -84,7 +84,7 @@ impl Clerk {
             Op::Append(key, value) => (key, value, 2),
         };
         let request = PutAppendRequest { key, value, op };
-        info!("{:?}", request);
+        info!("{}: {:?}", self.name, request);
         loop {
             // random choose a server to send command
             let server_index = rng.gen_range(0, self.num_server);
@@ -96,7 +96,7 @@ impl Clerk {
                         // this one is not leader, break and roll a new one
                         continue;
                     }
-                    info!("client result: done {:?}", put_append_reply);
+                    info!("{}: client result: done {:?}", self.name, put_append_reply);
 
                     return;
                 }
@@ -124,7 +124,10 @@ impl Clerk {
         let server = &self.servers[server_index];
         let (tx, rx) = channel();
 
+        // info!("{}: ", self.name);
+        let name = self.name.to_owned();
         server.spawn(server.get(args).map_err(Error::Rpc).then(move |res| {
+            info!("{}: {:?}", name, res);
             tx.send(res).unwrap_or_default();
             Ok(())
         }));
@@ -140,11 +143,14 @@ impl Clerk {
         let server = &self.servers[server_index];
         let (tx, rx) = channel();
 
+        // info!("{}: ", self.name);
+        let name = self.name.to_owned();
         server.spawn(
             server
                 .put_append(args)
                 .map_err(Error::Rpc)
                 .then(move |res| {
+                    info!("{}: {:?}", name, res);
                     tx.send(res).unwrap_or_default();
                     Ok(())
                 }),

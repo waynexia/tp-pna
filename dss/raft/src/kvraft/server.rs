@@ -7,7 +7,6 @@ use futures::sync::oneshot;
 // use futures::sync::oneshot::Sender as OSender;
 use futures::{Future, Stream};
 use labrpc::{Error as LError, RpcFuture};
-use rand::Rng;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,7 +26,7 @@ use super::errors::*;
 use crate::raft::ApplyMsg;
 
 const MAX_RESEND_COUNT: u64 = 10;
-const TIMEOUT_INTERVAL: u64 = 100; // in ms
+const TIMEOUT_INTERVAL: u64 = 1000; // in ms
 
 type ReplyBuffer = HashMap<(u64, u64), TOSender<ApplyResult>>;
 type CommandBuffer = HashMap<(u64, u64), Command>;
@@ -47,6 +46,7 @@ pub struct KvServer {
     term: Arc<AtomicU64>,
     // the number of last executed command
     pub curr_exec_idx: Arc<AtomicU64>,
+    // received from client
     pub curr_recv_idx: Arc<AtomicU64>,
     _rt: Runtime,
 }
@@ -120,18 +120,20 @@ impl KvServer {
         if !cmd.command_valid {
             return Ok(());
         }
+        let mut should_continue = true;
         match labcodec::decode::<Command>(&cmd.command) {
-            Ok(command) => {
-                match command.token.cmp(&curr_exec_idx.load(Ordering::SeqCst)) {
-                    std::cmp::Ordering::Less => {
-                        // executed, ignore
-                        return Ok(());
-                    }
-                    std::cmp::Ordering::Equal => {
-                        // execute, reply, check next index in buffer
-                        curr_exec_idx.fetch_add(1, Ordering::SeqCst);
-                        let mut should_continue = true;
-                        while should_continue {
+            Ok(mut command) => {
+                while should_continue {
+                    info!("going to execute: {:?}", command);
+                    should_continue = false;
+                    match command.token.cmp(&curr_exec_idx.load(Ordering::SeqCst)) {
+                        std::cmp::Ordering::Less => {
+                            // executed, ignore
+                            return Ok(());
+                        }
+                        std::cmp::Ordering::Equal => {
+                            // execute, reply, check next index in buffer
+                            curr_exec_idx.fetch_add(1, Ordering::SeqCst);
                             let mut err = None;
                             let mut value = None;
                             // get reply channel
@@ -187,25 +189,35 @@ impl KvServer {
                             }
                             // consider next command in buffer
                             // let reply_buffer = reply_buffer_lock.lock().unwrap();
-                            let command_buffer = command_buffer_lock.lock().unwrap();
+                            let mut command_buffer = command_buffer_lock.lock().unwrap();
                             should_continue = command_buffer.contains_key(&(
                                 term.load(Ordering::SeqCst),
                                 curr_exec_idx.load(Ordering::SeqCst),
                             ));
+                            if should_continue {
+                                command = command_buffer
+                                    .remove(&(
+                                        term.load(Ordering::SeqCst),
+                                        curr_exec_idx.load(Ordering::SeqCst),
+                                    ))
+                                    .unwrap();
+                            }
                         }
-                    }
-                    std::cmp::Ordering::Greater => {
-                        // out of order, store command into buffer
-                        let mut command_buffer = command_buffer_lock.lock().unwrap();
-                        command_buffer
-                            .insert((term.load(Ordering::SeqCst), command.token), command);
-                        drop(command_buffer);
-                    }
-                };
-                return Ok(());
+                        std::cmp::Ordering::Greater => {
+                            // out of order, store command into buffer
+                            let mut command_buffer = command_buffer_lock.lock().unwrap();
+                            command_buffer.insert(
+                                (term.load(Ordering::SeqCst), command.token),
+                                command.clone(),
+                            );
+                            drop(command_buffer);
+                        }
+                    };
+                    // return Ok(());
+                }
             }
             Err(e) => {
-                debug!("decode error: {:?}", e);
+                info!("decode error: {:?}", e);
             }
         }
         Ok(())
@@ -393,14 +405,12 @@ impl KvService for Node {
         }
 
         info!("start a write operation");
-        let mut rng = rand::thread_rng();
-        let token: u64 = rng.gen();
 
         let command = Command {
             command_type: args.op,
             key: args.key,
             value: Some(args.value),
-            token,
+            token: 0,
         };
         let (tx, rx) = oneshot::channel::<ApplyResult>();
         // self.server.try_put_append(command, tx);
