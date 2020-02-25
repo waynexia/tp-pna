@@ -1,6 +1,6 @@
 use rand::Rng;
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 // use std::thread;
@@ -23,6 +23,8 @@ pub struct Clerk {
     pub num_server: usize,
     // raft leader number
     leader: Arc<AtomicUsize>,
+    // command index
+    cmd_index: Arc<AtomicU64>,
 }
 
 impl fmt::Debug for Clerk {
@@ -40,6 +42,7 @@ impl Clerk {
             servers,
             num_server,
             leader: Arc::default(),
+            cmd_index: Arc::default(),
         }
     }
 
@@ -51,7 +54,11 @@ impl Clerk {
     // let reply = self.servers[i].get(args).unwrap();
     pub fn get(&self, key: String) -> String {
         let mut rng = rand::thread_rng();
-        let request = GetRequest { key };
+        let mut request = GetRequest {
+            key,
+            server_name: self.name.clone(),
+            cmd_index: self.cmd_index.fetch_add(1, Ordering::SeqCst),
+        };
         info!("{}: {:?}", self.name, request);
 
         let mut server_index = self.leader.load(Ordering::SeqCst);
@@ -60,6 +67,10 @@ impl Clerk {
 
             if let Ok(result) = rx.recv() {
                 if let Ok(get_reply) = result {
+                    if get_reply.err == Some("duplicate command".to_owned()) {
+                        request.cmd_index = self.cmd_index.fetch_add(1, Ordering::SeqCst);
+                        continue;
+                    }
                     if get_reply.wrong_leader || !get_reply.success {
                         // this one is not leader, break and roll a new one
                         server_index = rng.gen_range(0, self.num_server);
@@ -87,7 +98,13 @@ impl Clerk {
             Op::Put(key, value) => (key, value, 1),
             Op::Append(key, value) => (key, value, 2),
         };
-        let request = PutAppendRequest { key, value, op };
+        let request = PutAppendRequest {
+            key,
+            value,
+            op,
+            server_name: self.name.clone(),
+            cmd_index: self.cmd_index.fetch_add(1, Ordering::SeqCst),
+        };
         info!("{}: {:?}", self.name, request);
 
         let mut server_index = self.leader.load(Ordering::SeqCst);
@@ -98,6 +115,9 @@ impl Clerk {
 
             if let Ok(result) = rx.recv() {
                 if let Ok(put_append_reply) = result {
+                    if put_append_reply.err == Some("duplicate command".to_owned()) {
+                        return;
+                    }
                     if put_append_reply.wrong_leader || !put_append_reply.success {
                         // this one is not leader, break and roll a new one
                         server_index = rng.gen_range(0, self.num_server);

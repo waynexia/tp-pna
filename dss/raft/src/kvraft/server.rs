@@ -37,6 +37,7 @@ pub struct KvServer {
     me: usize,
     // snapshot indicator
     maxraftstate: Option<usize>,
+    pub clerk_index: Arc<Mutex<HashMap<String, u64>>>,
 
     _storage: Arc<Mutex<HashMap<String, String>>>,
     // buffer reply channel. <(term, exec_index), tx>
@@ -100,6 +101,7 @@ impl KvServer {
             rf: node,
             me,
             maxraftstate,
+            clerk_index: Arc::default(),
             _storage: storage,
             reply_buffer,
             command_buffer,
@@ -412,6 +414,7 @@ impl Node {
 impl KvService for Node {
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     fn get(&self, args: GetRequest) -> RpcFuture<ApplyResult> {
+        // check leadership
         if !self.is_leader() {
             return Box::new(futures::future::result(Ok(ApplyResult {
                 command_type: 3, //Get
@@ -421,7 +424,30 @@ impl KvService for Node {
                 value: Some("".to_owned()),
             })));
         }
-        info!("start a read operation");
+
+        // check clerk index
+        // let mut clerk_index = self.server.clerk_index.lock().unwrap();
+        // match clerk_index.get(&args.server_name) {
+        //     Some(x) => {
+        //         if &args.cmd_index <= x {
+        //             return Box::new(futures::future::result(Ok(ApplyResult {
+        //                 command_type: 3,
+        //                 wrong_leader: false,
+        //                 success: false,
+        //                 err: Some("duplicate command".to_owned()),
+        //                 value: None,
+        //             })));
+        //         } else {
+        //             clerk_index.insert(args.server_name.clone(), args.cmd_index.clone());
+        //         }
+        //     }
+        //     None => {
+        //         clerk_index.insert(args.server_name.clone(), args.cmd_index.clone());
+        //     }
+        // }
+        // drop(clerk_index);
+
+        info!("start a read operation: {:?}", args);
 
         let command = Command {
             command_type: 3, // Get
@@ -446,6 +472,7 @@ impl KvService for Node {
 
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     fn put_append(&self, args: PutAppendRequest) -> RpcFuture<ApplyResult> {
+        // check leadership
         if !self.is_leader() {
             return Box::new(futures::future::result(Ok(ApplyResult {
                 command_type: args.op,
@@ -456,7 +483,29 @@ impl KvService for Node {
             })));
         }
 
-        info!("start a write operation");
+        // check clerk index
+        let mut clerk_index = self.server.clerk_index.lock().unwrap();
+        match clerk_index.get(&args.server_name) {
+            Some(x) => {
+                if &args.cmd_index <= x {
+                    return Box::new(futures::future::result(Ok(ApplyResult {
+                        command_type: args.op,
+                        wrong_leader: false,
+                        success: false,
+                        err: Some("duplicate command".to_owned()),
+                        value: None,
+                    })));
+                } else {
+                    clerk_index.insert(args.server_name.clone(), args.cmd_index.clone());
+                }
+            }
+            None => {
+                clerk_index.insert(args.server_name.clone(), args.cmd_index.clone());
+            }
+        }
+        drop(clerk_index);
+
+        info!("start a write operation: {:?}", args);
 
         let command = Command {
             command_type: args.op,

@@ -14,7 +14,8 @@ message PutAppendRequest {
     string value = 2;
     // "Put" or "Append"
     Op op = 3;
-    // You'll have to add definitions here.
+    string server_name = 4;
+    uint64 cmd_index = 5;
 }
 
 message PutAppendReply {
@@ -24,7 +25,8 @@ message PutAppendReply {
 
 message GetRequest {
     string key = 1;
-    // You'll have to add definitions here.
+    string server_name = 2;
+    uint64 cmd_index = 3;
 }
 
 message GetReply {
