@@ -43,11 +43,12 @@ pub struct KvServer {
     pub reply_buffer: Arc<Mutex<ReplyBuffer>>,
     // buffer unordered commands
     pub command_buffer: Arc<Mutex<CommandBuffer>>,
-    term: Arc<AtomicU64>,
+    recv_term: Arc<AtomicU64>,
+    pub exec_term: Arc<AtomicU64>,
     // the number of last executed command
-    pub curr_exec_idx: Arc<AtomicU64>,
+    pub exec_idx: Arc<AtomicU64>,
     // received from client
-    pub curr_recv_idx: Arc<AtomicU64>,
+    pub recv_idx: Arc<AtomicU64>,
     _rt: Runtime,
 }
 
@@ -65,25 +66,25 @@ impl KvServer {
         let storage = Arc::new(Mutex::new(HashMap::new()));
         let reply_buffer = Arc::new(Mutex::new(HashMap::new()));
         let command_buffer = Arc::new(Mutex::new(HashMap::new()));
-        let curr_exec_idx = Arc::new(AtomicU64::new(0));
-        let term = Arc::new(AtomicU64::new(0));
+        let exec_idx = Arc::new(AtomicU64::new(0));
+        let exec_term = Arc::new(AtomicU64::new(0));
 
         // let re_apply_tx = tx;
-        let term_tomove = term.clone();
-        let curr_exec_idx_tomove = curr_exec_idx.clone();
+        let exec_term_tomove = exec_term.clone();
+        let exec_idx_tomove = exec_idx.clone();
         let storage_tomove = storage.clone();
         let reply_buffer_tomove = reply_buffer.clone();
         let command_buffer_tomove = command_buffer.clone();
         let apply = apply_ch.for_each(move |cmd| {
-            let term = term_tomove.clone();
-            let curr_exec_idx = curr_exec_idx_tomove.clone();
+            let exec_term = exec_term_tomove.clone();
+            let exec_idx = exec_idx_tomove.clone();
             let storage = storage_tomove.clone();
             let reply_buffer = reply_buffer_tomove.clone();
             let command_buffer = command_buffer_tomove.clone();
             KvServer::execute_command(
-                term,
+                exec_term,
                 cmd,
-                curr_exec_idx,
+                exec_idx,
                 storage,
                 reply_buffer,
                 command_buffer,
@@ -102,17 +103,18 @@ impl KvServer {
             _storage: storage,
             reply_buffer,
             command_buffer,
-            term,
-            curr_exec_idx,
-            curr_recv_idx: Arc::new(AtomicU64::new(0)),
+            exec_term,
+            exec_idx,
+            recv_term: Arc::new(AtomicU64::new(0)),
+            recv_idx: Arc::new(AtomicU64::new(0)),
             _rt: rt,
         }
     }
 
     pub fn execute_command(
-        term: Arc<AtomicU64>,
+        exec_term: Arc<AtomicU64>,
         cmd: ApplyMsg,
-        curr_exec_idx: Arc<AtomicU64>,
+        exec_idx: Arc<AtomicU64>,
         storage: Arc<Mutex<HashMap<String, String>>>,
         reply_buffer_lock: Arc<Mutex<ReplyBuffer>>,
         command_buffer_lock: Arc<Mutex<CommandBuffer>>,
@@ -126,21 +128,25 @@ impl KvServer {
                 while should_continue {
                     info!("going to execute: {:?}", command);
                     should_continue = false;
-                    match command.token.cmp(&curr_exec_idx.load(Ordering::SeqCst)) {
+                    match KvServer::comp_header(
+                        (command.term, command.token),
+                        &exec_term,
+                        &exec_idx,
+                    ) {
+                        // match command.token.cmp(&exec_idx.load(Ordering::SeqCst)) {
                         std::cmp::Ordering::Less => {
                             // executed, ignore
                             return Ok(());
                         }
                         std::cmp::Ordering::Equal => {
                             // execute, reply, check next index in buffer
-                            curr_exec_idx.fetch_add(1, Ordering::SeqCst);
+                            exec_idx.fetch_add(1, Ordering::SeqCst);
                             let mut err = None;
                             let mut value = None;
                             // get reply channel
                             let mut reply_buffer = reply_buffer_lock.lock().unwrap();
                             // follower server need not to report
-                            let reply_ch =
-                                reply_buffer.remove(&(term.load(Ordering::SeqCst), command.token));
+                            let reply_ch = reply_buffer.remove(&(command.term, command.token));
                             drop(reply_buffer);
                             // execute command
                             let mut storage = storage.lock().unwrap();
@@ -155,8 +161,6 @@ impl KvServer {
                                 }
                                 // Append
                                 2 => {
-                                    // let key = command.key.clone();
-                                    // let value = command.value.clone().unwrap();
                                     let prev_value = storage
                                         .get(&command.key)
                                         .map(|s| s.to_owned())
@@ -188,17 +192,16 @@ impl KvServer {
                                     .unwrap_or_default();
                             }
                             // consider next command in buffer
-                            // let reply_buffer = reply_buffer_lock.lock().unwrap();
                             let mut command_buffer = command_buffer_lock.lock().unwrap();
                             should_continue = command_buffer.contains_key(&(
-                                term.load(Ordering::SeqCst),
-                                curr_exec_idx.load(Ordering::SeqCst),
+                                exec_term.load(Ordering::SeqCst),
+                                exec_idx.load(Ordering::SeqCst),
                             ));
                             if should_continue {
                                 command = command_buffer
                                     .remove(&(
-                                        term.load(Ordering::SeqCst),
-                                        curr_exec_idx.load(Ordering::SeqCst),
+                                        exec_term.load(Ordering::SeqCst),
+                                        exec_idx.load(Ordering::SeqCst),
                                     ))
                                     .unwrap();
                             }
@@ -206,14 +209,10 @@ impl KvServer {
                         std::cmp::Ordering::Greater => {
                             // out of order, store command into buffer
                             let mut command_buffer = command_buffer_lock.lock().unwrap();
-                            command_buffer.insert(
-                                (term.load(Ordering::SeqCst), command.token),
-                                command.clone(),
-                            );
+                            command_buffer.insert((command.term, command.token), command.clone());
                             drop(command_buffer);
                         }
                     };
-                    // return Ok(());
                 }
             }
             Err(e) => {
@@ -223,28 +222,81 @@ impl KvServer {
         Ok(())
     }
 
-    fn allc_header(&self) -> u64 {
-        self.curr_recv_idx.fetch_add(1, Ordering::SeqCst)
+    /// Header consist of raft's term and command's index in this term.
+    /// It is used to identify commands' ordering and duplication.
+    /// Index starts from 0 and goes monotone increase in a single term.
+    fn allc_header(&self) -> (u64, u64) {
+        let term = self.get_term();
+        let curr_term = self.recv_term.load(Ordering::SeqCst);
+
+        // consider data race
+        if term != curr_term {
+            let recv_index = self.recv_idx.clone();
+            self.recv_term
+                .fetch_update(
+                    move |_| {
+                        recv_index.store(0, Ordering::SeqCst);
+                        Some(term)
+                    },
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .unwrap();
+        }
+
+        (term, self.recv_idx.fetch_add(1, Ordering::SeqCst))
+    }
+
+    pub fn comp_header(
+        header: (u64, u64),
+        exec_term: &Arc<AtomicU64>,
+        exec_index: &Arc<AtomicU64>,
+    ) -> std::cmp::Ordering {
+        let (term, index) = header;
+        if term != exec_term.load(Ordering::SeqCst) {
+            // term has changed. which means:
+            // 1), all commands in previous term is received by server. Thus two buffer
+            // should be empty.
+            // 2), need to reset exec_idx
+            exec_term.store(term, Ordering::SeqCst);
+            exec_index.store(0, Ordering::SeqCst);
+        }
+        index.cmp(&exec_index.load(Ordering::SeqCst))
     }
 
     pub fn get_state(&self) -> Arc<raft::State> {
         self.rf.get_state()
     }
 
+    pub fn get_term(&self) -> u64 {
+        self.rf.term()
+    }
+
     pub async fn start_command(&self, mut args: Command) -> ApplyResult {
+        if !self.get_state().is_leader() {
+            return ApplyResult {
+                command_type: args.command_type,
+                wrong_leader: true,
+                success: false,
+                err: Some("not leader".to_owned()),
+                value: None,
+            };
+        }
         // set header
-        let idx = self.allc_header();
+        let (term, idx) = self.allc_header();
+        args.term = term;
         args.token = idx;
 
         // for server to report execute result
         let (result_tx, result_rx) = tokio_oneshot();
         let mut reply_buffer = self.reply_buffer.lock().unwrap();
-        if reply_buffer.contains_key(&(self.term.load(Ordering::SeqCst), idx)) {
+        if reply_buffer.contains_key(&(term, idx)) {
             // todo: change error type
             // return Err(Error::Others);
+            info!("{}, {}", term, idx);
             unreachable!();
         }
-        reply_buffer.insert((self.term.load(Ordering::SeqCst), idx), result_tx);
+        reply_buffer.insert((term, idx), result_tx);
         drop(reply_buffer);
 
         match self.start(&args, result_rx).await {
@@ -375,10 +427,10 @@ impl KvService for Node {
             command_type: 3, // Get
             key: args.key,
             value: None,
+            term: 0,
             token: 0,
         };
         let (tx, rx) = oneshot::channel::<ApplyResult>();
-        // self.server.try_get(command, tx);
         let server = self.server.clone();
         // todo: use runtime.spawn()
         thread::spawn(move || {
@@ -410,10 +462,10 @@ impl KvService for Node {
             command_type: args.op,
             key: args.key,
             value: Some(args.value),
+            term: 0,
             token: 0,
         };
         let (tx, rx) = oneshot::channel::<ApplyResult>();
-        // self.server.try_put_append(command, tx);
         let server = self.server.clone();
         // todo: use runtime.spawn()
         thread::spawn(move || {

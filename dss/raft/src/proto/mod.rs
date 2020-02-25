@@ -47,6 +47,8 @@ pub mod kvraftpb {
         #[prost(optional, string, tag = "3")]
         pub value: Option<String>,
         #[prost(uint64, tag = "4")]
+        pub term: u64,
+        #[prost(uint64, tag = "5")]
         pub token: u64,
     }
 

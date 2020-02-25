@@ -2,6 +2,8 @@
 #![deny(clippy::all)]
 // for atomic fetch_max
 #![feature(atomic_min_max)]
+// for atomic fetch_update
+#![feature(no_more_cas)]
 
 #[allow(unused_imports)]
 #[macro_use]
