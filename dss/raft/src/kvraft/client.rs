@@ -81,6 +81,8 @@ impl Clerk {
 
                     self.leader.store(server_index, Ordering::SeqCst);
                     return value;
+                } else {
+                    server_index = rng.gen_range(0, self.num_server);
                 }
             }
         }
@@ -126,9 +128,10 @@ impl Clerk {
                     info!("{}: client result: done {:?}", self.name, put_append_reply);
 
                     return;
+                } else {
+                    server_index = rng.gen_range(0, self.num_server);
                 }
             }
-            // thread::sleep(Duration::from_millis(500));
         }
     }
 
@@ -154,7 +157,7 @@ impl Clerk {
         // info!("{}: ", self.name);
         let name = self.name.to_owned();
         server.spawn(server.get(args).map_err(Error::Rpc).then(move |res| {
-            info!("{}: {:?}", name, res);
+            info!("{} received: {:?}", name, res);
             tx.send(res).unwrap_or_default();
             Ok(())
         }));
@@ -177,7 +180,7 @@ impl Clerk {
                 .put_append(args)
                 .map_err(Error::Rpc)
                 .then(move |res| {
-                    info!("{}: {:?}", name, res);
+                    info!("{} received: {:?}", name, res);
                     tx.send(res).unwrap_or_default();
                     Ok(())
                 }),
