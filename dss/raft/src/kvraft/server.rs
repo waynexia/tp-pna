@@ -64,19 +64,21 @@ impl KvServer {
         let raft = raft::Raft::new(servers, me, persister, tx);
         let node = raft::Node::new(raft);
 
+        let clerk_index = Arc::new(Mutex::new(HashMap::new()));
         let storage = Arc::new(Mutex::new(HashMap::new()));
         let reply_buffer = Arc::new(Mutex::new(HashMap::new()));
         let command_buffer = Arc::new(Mutex::new(HashMap::new()));
         let exec_idx = Arc::new(AtomicU64::new(0));
         let exec_term = Arc::new(AtomicU64::new(0));
 
-        // let re_apply_tx = tx;
+        let clerk_index_tomove = clerk_index.clone();
         let exec_term_tomove = exec_term.clone();
         let exec_idx_tomove = exec_idx.clone();
         let storage_tomove = storage.clone();
         let reply_buffer_tomove = reply_buffer.clone();
         let command_buffer_tomove = command_buffer.clone();
         let apply = apply_ch.for_each(move |cmd| {
+            let clerk_index = clerk_index_tomove.clone();
             let exec_term = exec_term_tomove.clone();
             let exec_idx = exec_idx_tomove.clone();
             let storage = storage_tomove.clone();
@@ -89,6 +91,7 @@ impl KvServer {
                 storage,
                 reply_buffer,
                 command_buffer,
+                clerk_index,
             )
             .unwrap_or_default();
             Ok(())
@@ -101,7 +104,7 @@ impl KvServer {
             rf: node,
             me,
             maxraftstate,
-            clerk_index: Arc::default(),
+            clerk_index,
             _storage: storage,
             reply_buffer,
             command_buffer,
@@ -120,6 +123,7 @@ impl KvServer {
         storage: Arc<Mutex<HashMap<String, String>>>,
         reply_buffer_lock: Arc<Mutex<ReplyBuffer>>,
         command_buffer_lock: Arc<Mutex<CommandBuffer>>,
+        clerk_index_lock: Arc<Mutex<HashMap<String, u64>>>,
     ) -> Result<()> {
         if !cmd.command_valid {
             return Ok(());
@@ -135,7 +139,6 @@ impl KvServer {
                         &exec_term,
                         &exec_idx,
                     ) {
-                        // match command.token.cmp(&exec_idx.load(Ordering::SeqCst)) {
                         std::cmp::Ordering::Less => {
                             // executed, ignore
                             return Ok(());
@@ -163,13 +166,42 @@ impl KvServer {
                                 }
                                 // Append
                                 2 => {
-                                    let prev_value = storage
-                                        .get(&command.key)
-                                        .map(|s| s.to_owned())
-                                        .unwrap_or_default();
-                                    let new_value =
-                                        format!("{}{}", prev_value, command.value.clone().unwrap());
-                                    storage.insert(command.key.clone(), new_value);
+                                    // check clerk index
+                                    let mut clerk_index = clerk_index_lock.lock().unwrap();
+                                    if let Some(x) = clerk_index.get(&command.clerk_name) {
+                                        if &command.clerk_index > x {
+                                            clerk_index.insert(
+                                                command.clerk_name.clone(),
+                                                command.clerk_index.clone(),
+                                            );
+                                            let prev_value = storage
+                                                .get(&command.key)
+                                                .map(|s| s.to_owned())
+                                                .unwrap_or_default();
+                                            let new_value = format!(
+                                                "{}{}",
+                                                prev_value,
+                                                command.value.clone().unwrap()
+                                            );
+                                            storage.insert(command.key.clone(), new_value);
+                                        }
+                                    } else {
+                                        clerk_index.insert(
+                                            command.clerk_name.clone(),
+                                            command.clerk_index.clone(),
+                                        );
+                                        let prev_value = storage
+                                            .get(&command.key)
+                                            .map(|s| s.to_owned())
+                                            .unwrap_or_default();
+                                        let new_value = format!(
+                                            "{}{}",
+                                            prev_value,
+                                            command.value.clone().unwrap()
+                                        );
+                                        storage.insert(command.key.clone(), new_value);
+                                    }
+                                    drop(clerk_index);
                                 }
                                 // Get
                                 3 => {
@@ -425,28 +457,6 @@ impl KvService for Node {
             })));
         }
 
-        // check clerk index
-        // let mut clerk_index = self.server.clerk_index.lock().unwrap();
-        // match clerk_index.get(&args.server_name) {
-        //     Some(x) => {
-        //         if &args.cmd_index <= x {
-        //             return Box::new(futures::future::result(Ok(ApplyResult {
-        //                 command_type: 3,
-        //                 wrong_leader: false,
-        //                 success: false,
-        //                 err: Some("duplicate command".to_owned()),
-        //                 value: None,
-        //             })));
-        //         } else {
-        //             clerk_index.insert(args.server_name.clone(), args.cmd_index.clone());
-        //         }
-        //     }
-        //     None => {
-        //         clerk_index.insert(args.server_name.clone(), args.cmd_index.clone());
-        //     }
-        // }
-        // drop(clerk_index);
-
         info!("start a read operation: {:?}", args);
 
         let command = Command {
@@ -455,6 +465,8 @@ impl KvService for Node {
             value: None,
             term: 0,
             token: 0,
+            clerk_name: args.server_name,
+            clerk_index: args.cmd_index,
         };
         let (tx, rx) = oneshot::channel::<ApplyResult>();
         let server = self.server.clone();
@@ -483,28 +495,6 @@ impl KvService for Node {
             })));
         }
 
-        // check clerk index
-        let mut clerk_index = self.server.clerk_index.lock().unwrap();
-        match clerk_index.get(&args.server_name) {
-            Some(x) => {
-                if &args.cmd_index <= x {
-                    return Box::new(futures::future::result(Ok(ApplyResult {
-                        command_type: args.op,
-                        wrong_leader: false,
-                        success: false,
-                        err: Some("duplicate command".to_owned()),
-                        value: None,
-                    })));
-                } else {
-                    clerk_index.insert(args.server_name.clone(), args.cmd_index.clone());
-                }
-            }
-            None => {
-                clerk_index.insert(args.server_name.clone(), args.cmd_index.clone());
-            }
-        }
-        drop(clerk_index);
-
         info!("start a write operation: {:?}", args);
 
         let command = Command {
@@ -513,6 +503,8 @@ impl KvService for Node {
             value: Some(args.value),
             term: 0,
             token: 0,
+            clerk_name: args.server_name,
+            clerk_index: args.cmd_index,
         };
         let (tx, rx) = oneshot::channel::<ApplyResult>();
         let server = self.server.clone();

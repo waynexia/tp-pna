@@ -50,6 +50,10 @@ pub mod kvraftpb {
         pub term: u64,
         #[prost(uint64, tag = "5")]
         pub token: u64,
+        #[prost(string, tag = "6")]
+        pub clerk_name: String,
+        #[prost(uint64, tag = "7")]
+        pub clerk_index: u64,
     }
 
     #[derive(Clone, PartialEq, Message)]
