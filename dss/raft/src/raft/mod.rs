@@ -691,10 +691,17 @@ impl Raft {
                     me, args.prev_log_index, args.prev_log_term, prev_log_index, prev_log_term,
                 );
 
-                // return error to let leader decrease "next_index"
+                // return error to decrease "next_index"
                 drop(log);
                 let mut log = state.log.lock().unwrap();
-                if args.prev_log_index > log.len() as u64 || args.prev_log_term != prev_log_term {
+                let overwrite_entire_term = args.prev_log_index < log.len() as u64
+                    && args.prev_log_index != 0
+                    && state.get_log_term_by_index(args.prev_log_index, &log)
+                        == state.get_log_term_by_index(args.prev_log_index - 1, &log);
+                if args.prev_log_index > log.len() as u64
+                    || args.prev_log_term != prev_log_term
+                    || overwrite_entire_term
+                {
                     debug!("{} reject append entries rpc", me);
                     // return (state.term(), false);
                     return Box::new(futures::future::result(Ok(AppendEntriesReply {
@@ -796,8 +803,7 @@ impl Raft {
                         .state
                         .current_term
                         .fetch_max(incoming_term, Ordering::SeqCst)
-                        .max(incoming_term)
-                        == incoming_term
+                        < incoming_term
                     {
                         let mut voted_for = self.state.voted_for.lock().unwrap();
                         *voted_for = None;
