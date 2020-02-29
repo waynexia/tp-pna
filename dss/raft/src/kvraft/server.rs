@@ -25,11 +25,10 @@ use super::errors::*;
 
 use crate::raft::ApplyMsg;
 
-const MAX_RESEND_COUNT: u64 = 10;
+// const MAX_RESEND_COUNT: u64 = 1;
 const TIMEOUT_INTERVAL: u64 = 1000; // in ms
 
 type ReplyBuffer = HashMap<(u64, u64), TOSender<ApplyResult>>;
-type CommandBuffer = HashMap<(u64, u64), Command>;
 
 pub struct KvServer {
     pub rf: raft::Node,
@@ -42,13 +41,7 @@ pub struct KvServer {
     _storage: Arc<Mutex<HashMap<String, String>>>,
     // buffer reply channel. <(term, exec_index), tx>
     pub reply_buffer: Arc<Mutex<ReplyBuffer>>,
-    // buffer unordered commands
-    pub command_buffer: Arc<Mutex<CommandBuffer>>,
     recv_term: Arc<AtomicU64>,
-    pub exec_term: Arc<AtomicU64>,
-    // the number of last executed command
-    pub exec_idx: Arc<AtomicU64>,
-    // received from client
     pub recv_idx: Arc<AtomicU64>,
     _rt: Runtime,
 }
@@ -67,33 +60,15 @@ impl KvServer {
         let clerk_index = Arc::new(Mutex::new(HashMap::new()));
         let storage = Arc::new(Mutex::new(HashMap::new()));
         let reply_buffer = Arc::new(Mutex::new(HashMap::new()));
-        let command_buffer = Arc::new(Mutex::new(HashMap::new()));
-        let exec_idx = Arc::new(AtomicU64::new(0));
-        let exec_term = Arc::new(AtomicU64::new(0));
 
         let clerk_index_tomove = clerk_index.clone();
-        let exec_term_tomove = exec_term.clone();
-        let exec_idx_tomove = exec_idx.clone();
         let storage_tomove = storage.clone();
         let reply_buffer_tomove = reply_buffer.clone();
-        let command_buffer_tomove = command_buffer.clone();
         let apply = apply_ch.for_each(move |cmd| {
             let clerk_index = clerk_index_tomove.clone();
-            let exec_term = exec_term_tomove.clone();
-            let exec_idx = exec_idx_tomove.clone();
             let storage = storage_tomove.clone();
             let reply_buffer = reply_buffer_tomove.clone();
-            let command_buffer = command_buffer_tomove.clone();
-            KvServer::execute_command(
-                exec_term,
-                cmd,
-                exec_idx,
-                storage,
-                reply_buffer,
-                command_buffer,
-                clerk_index,
-            )
-            .unwrap_or_default();
+            KvServer::execute_command(cmd, storage, reply_buffer, clerk_index).unwrap_or_default();
             Ok(())
         });
 
@@ -107,9 +82,6 @@ impl KvServer {
             clerk_index,
             _storage: storage,
             reply_buffer,
-            command_buffer,
-            exec_term,
-            exec_idx,
             recv_term: Arc::new(AtomicU64::new(0)),
             recv_idx: Arc::new(AtomicU64::new(0)),
             _rt: rt,
@@ -117,136 +89,85 @@ impl KvServer {
     }
 
     pub fn execute_command(
-        exec_term: Arc<AtomicU64>,
         cmd: ApplyMsg,
-        exec_idx: Arc<AtomicU64>,
         storage: Arc<Mutex<HashMap<String, String>>>,
         reply_buffer_lock: Arc<Mutex<ReplyBuffer>>,
-        command_buffer_lock: Arc<Mutex<CommandBuffer>>,
         clerk_index_lock: Arc<Mutex<HashMap<String, u64>>>,
     ) -> Result<()> {
         if !cmd.command_valid {
             return Ok(());
         }
-        let mut should_continue = true;
         match labcodec::decode::<Command>(&cmd.command) {
-            Ok(mut command) => {
-                while should_continue {
-                    info!("going to execute: {:?}", command);
-                    should_continue = false;
-                    match KvServer::comp_header(
-                        (command.term, command.token),
-                        &exec_term,
-                        &exec_idx,
-                    ) {
-                        std::cmp::Ordering::Less => {
-                            // executed, ignore
-                            return Ok(());
-                        }
-                        std::cmp::Ordering::Equal => {
-                            // execute, reply, check next index in buffer
-                            exec_idx.fetch_add(1, Ordering::SeqCst);
-                            let mut err = None;
-                            let mut value = None;
-                            // get reply channel
-                            let mut reply_buffer = reply_buffer_lock.lock().unwrap();
-                            // follower server need not to report
-                            let reply_ch = reply_buffer.remove(&(command.term, command.token));
-                            drop(reply_buffer);
-                            // execute command
-                            let mut storage = storage.lock().unwrap();
-                            match command.command_type {
-                                // Put
-                                1 => {
-                                    storage.remove(&command.key);
-                                    storage.insert(
-                                        command.key.clone(),
-                                        command.value.clone().unwrap(),
-                                    );
-                                }
-                                // Append
-                                2 => {
-                                    // check clerk index
-                                    let mut clerk_index = clerk_index_lock.lock().unwrap();
-                                    if let Some(x) = clerk_index.get(&command.clerk_name) {
-                                        if &command.clerk_index > x {
-                                            clerk_index.insert(
-                                                command.clerk_name.clone(),
-                                                command.clerk_index.clone(),
-                                            );
-                                            let prev_value = storage
-                                                .get(&command.key)
-                                                .map(|s| s.to_owned())
-                                                .unwrap_or_default();
-                                            let new_value = format!(
-                                                "{}{}",
-                                                prev_value,
-                                                command.value.clone().unwrap()
-                                            );
-                                            storage.insert(command.key.clone(), new_value);
-                                        }
-                                    } else {
-                                        clerk_index.insert(
-                                            command.clerk_name.clone(),
-                                            command.clerk_index.clone(),
-                                        );
-                                        let prev_value = storage
-                                            .get(&command.key)
-                                            .map(|s| s.to_owned())
-                                            .unwrap_or_default();
-                                        let new_value = format!(
-                                            "{}{}",
-                                            prev_value,
-                                            command.value.clone().unwrap()
-                                        );
-                                        storage.insert(command.key.clone(), new_value);
-                                    }
-                                    drop(clerk_index);
-                                }
-                                // Get
-                                3 => {
-                                    if !storage.contains_key(&command.key) {
-                                        err = Some("key does not exist".to_owned());
-                                        value = Some("".to_owned());
-                                    } else {
-                                        value = Some(storage.get(&command.key).unwrap().to_owned());
-                                    }
-                                }
-                                _ => unreachable!(),
-                            }
-                            if let Some(channel) = reply_ch {
-                                channel
-                                    .send(ApplyResult {
-                                        command_type: command.command_type,
-                                        success: true,
-                                        wrong_leader: false,
-                                        err,
-                                        value,
-                                    })
+            Ok(command) => {
+                info!("going to execute: {:?}", command);
+                let mut err = None;
+                let mut value = None;
+                // get reply channel
+                let mut reply_buffer = reply_buffer_lock.lock().unwrap();
+                // follower server need not to report
+                let reply_ch = reply_buffer.remove(&(command.term, command.token));
+                drop(reply_buffer);
+                // execute command
+                let mut storage = storage.lock().unwrap();
+                match command.command_type {
+                    // Put
+                    1 => {
+                        storage.remove(&command.key);
+                        storage.insert(command.key.clone(), command.value.clone().unwrap());
+                    }
+                    // Append
+                    2 => {
+                        // check clerk index
+                        let mut clerk_index = clerk_index_lock.lock().unwrap();
+                        if let Some(x) = clerk_index.get(&command.clerk_name) {
+                            if &command.clerk_index > x {
+                                clerk_index.insert(
+                                    command.clerk_name.clone(),
+                                    command.clerk_index.clone(),
+                                );
+                                let prev_value = storage
+                                    .get(&command.key)
+                                    .map(|s| s.to_owned())
                                     .unwrap_or_default();
+                                let new_value =
+                                    format!("{}{}", prev_value, command.value.clone().unwrap());
+                                storage.insert(command.key.clone(), new_value);
                             }
-                            // consider next command in buffer
-                            let mut command_buffer = command_buffer_lock.lock().unwrap();
-                            should_continue = command_buffer.contains_key(&(
-                                exec_term.load(Ordering::SeqCst),
-                                exec_idx.load(Ordering::SeqCst),
-                            ));
-                            if should_continue {
-                                command = command_buffer
-                                    .remove(&(
-                                        exec_term.load(Ordering::SeqCst),
-                                        exec_idx.load(Ordering::SeqCst),
-                                    ))
-                                    .unwrap();
-                            }
+                        } else {
+                            clerk_index
+                                .insert(command.clerk_name.clone(), command.clerk_index.clone());
+                            let prev_value = storage
+                                .get(&command.key)
+                                .map(|s| s.to_owned())
+                                .unwrap_or_default();
+                            let new_value =
+                                format!("{}{}", prev_value, command.value.clone().unwrap());
+                            storage.insert(command.key.clone(), new_value);
                         }
-                        std::cmp::Ordering::Greater => {
-                            // out of order, store command into buffer
-                            let mut command_buffer = command_buffer_lock.lock().unwrap();
-                            command_buffer.insert((command.term, command.token), command.clone());
-                            drop(command_buffer);
+                        drop(clerk_index);
+                    }
+                    // Get
+                    3 => {
+                        if !storage.contains_key(&command.key) {
+                            err = Some("key does not exist".to_owned());
+                            value = Some("".to_owned());
+                        } else {
+                            value = Some(storage.get(&command.key).unwrap().to_owned());
                         }
-                    };
+                    }
+                    _ => unreachable!(),
+                }
+                drop(storage);
+                if let Some(channel) = reply_ch {
+                    channel
+                        .send(ApplyResult {
+                            command_type: command.command_type,
+                            success: true,
+                            wrong_leader: false,
+                            err,
+                            value,
+                        })
+                        .unwrap_or_default();
                 }
             }
             Err(e) => {
@@ -276,26 +197,10 @@ impl KvServer {
                     Ordering::SeqCst,
                 )
                 .unwrap();
+            info!("new term {}", term);
         }
 
         (term, self.recv_idx.fetch_add(1, Ordering::SeqCst))
-    }
-
-    pub fn comp_header(
-        header: (u64, u64),
-        exec_term: &Arc<AtomicU64>,
-        exec_index: &Arc<AtomicU64>,
-    ) -> std::cmp::Ordering {
-        let (term, index) = header;
-        if term != exec_term.load(Ordering::SeqCst) {
-            // term has changed. which means:
-            // 1), all commands in previous term is received by server. Thus two buffer
-            // should be empty.
-            // 2), need to reset exec_idx
-            exec_term.store(term, Ordering::SeqCst);
-            exec_index.store(0, Ordering::SeqCst);
-        }
-        index.cmp(&exec_index.load(Ordering::SeqCst))
     }
 
     pub fn get_state(&self) -> Arc<raft::State> {
@@ -306,7 +211,7 @@ impl KvServer {
         self.rf.term()
     }
 
-    pub async fn start_command(&self, mut args: Command) -> ApplyResult {
+    pub async fn start(&self, mut args: Command) -> ApplyResult {
         if !self.get_state().is_leader() {
             return ApplyResult {
                 command_type: args.command_type,
@@ -333,7 +238,7 @@ impl KvServer {
         reply_buffer.insert((term, idx), result_tx);
         drop(reply_buffer);
 
-        match self.start(&args, result_rx).await {
+        match self.timeout_send(&args, result_rx).await {
             Ok(result) => result,
             Err(e) => ApplyResult {
                 command_type: args.command_type,
@@ -345,34 +250,21 @@ impl KvServer {
         }
     }
 
-    pub async fn start<M>(
+    async fn timeout_send(
         &self,
-        command: &M,
-        // exec_index: u64,
+        command: &Command,
         mut result_rx: TOReceiver<ApplyResult>,
-    ) -> Result<ApplyResult>
-    where
-        M: labcodec::Message,
-    {
+    ) -> Result<ApplyResult> {
         info!("start a command");
 
-        let mut timeout_cnt = 0;
-        let mut delay = tokio02::time::delay_for(Duration::from_millis(0));
-
+        let mut delay = tokio02::time::delay_for(Duration::from_millis(TIMEOUT_INTERVAL));
+        if self.rf.start(command).is_err() {
+            return Err(Error::NoLeader);
+        }
         loop {
             tokio02::select! {
                 _ = &mut delay => {
-                    // timeout
-                    if timeout_cnt < MAX_RESEND_COUNT{
-                        // reset timer and resend
-                        timeout_cnt += 1;
-                        if self.rf.start(command).is_err() {
-                            return Err(Error::NoLeader);
-                        }
-                        delay = tokio02::time::delay_for(Duration::from_millis(TIMEOUT_INTERVAL));
-                    } else {
-                        return Err(Error::Timeout);
-                    }
+                    return Err(Error::Timeout);
                 }
                 result = &mut result_rx => {
                     return result.map_err(|_| Error::Others);
@@ -475,7 +367,7 @@ impl KvService for Node {
             tx.send(
                 tokio02_Runtime::new()
                     .unwrap()
-                    .block_on(server.start_command(command)),
+                    .block_on(server.start(command)),
             )
             .unwrap_or_default();
         });
@@ -513,7 +405,7 @@ impl KvService for Node {
             tx.send(
                 tokio02_Runtime::new()
                     .unwrap()
-                    .block_on(server.start_command(command)),
+                    .block_on(server.start(command)),
             )
         });
         Box::new(rx.map_err(LError::Recv))
