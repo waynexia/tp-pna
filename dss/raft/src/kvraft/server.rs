@@ -107,35 +107,36 @@ impl KvServer {
                 // follower server need not to report
                 let reply_ch = reply_buffer.remove(&(command.term, command.token));
                 drop(reply_buffer);
+
+                // check duplicate
+                let mut is_duplicate = false;
+                let mut clerk_index = clerk_index_lock.lock().unwrap();
+                if command.command_type == 1 || command.command_type == 2 {
+                    // is write operation
+                    if let Some(x) = clerk_index.get(&command.clerk_name) {
+                        if &command.clerk_index <= x {
+                            is_duplicate = true;
+                        }
+                    }
+                }
+                if !is_duplicate {
+                    clerk_index.insert(command.clerk_name.clone(), command.clerk_index.clone());
+                }
+                drop(clerk_index);
+
                 // execute command
                 let mut storage = storage.lock().unwrap();
                 match command.command_type {
                     // Put
                     1 => {
-                        storage.remove(&command.key);
-                        storage.insert(command.key.clone(), command.value.clone().unwrap());
+                        if !is_duplicate {
+                            storage.remove(&command.key);
+                            storage.insert(command.key.clone(), command.value.clone().unwrap());
+                        }
                     }
                     // Append
                     2 => {
-                        // check clerk index
-                        let mut clerk_index = clerk_index_lock.lock().unwrap();
-                        if let Some(x) = clerk_index.get(&command.clerk_name) {
-                            if &command.clerk_index > x {
-                                clerk_index.insert(
-                                    command.clerk_name.clone(),
-                                    command.clerk_index.clone(),
-                                );
-                                let prev_value = storage
-                                    .get(&command.key)
-                                    .map(|s| s.to_owned())
-                                    .unwrap_or_default();
-                                let new_value =
-                                    format!("{}{}", prev_value, command.value.clone().unwrap());
-                                storage.insert(command.key.clone(), new_value);
-                            }
-                        } else {
-                            clerk_index
-                                .insert(command.clerk_name.clone(), command.clerk_index.clone());
+                        if !is_duplicate {
                             let prev_value = storage
                                 .get(&command.key)
                                 .map(|s| s.to_owned())
@@ -144,7 +145,6 @@ impl KvServer {
                                 format!("{}{}", prev_value, command.value.clone().unwrap());
                             storage.insert(command.key.clone(), new_value);
                         }
-                        drop(clerk_index);
                     }
                     // Get
                     3 => {
